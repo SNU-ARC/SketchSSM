@@ -1,0 +1,56 @@
+# Collected with the BF16 checkpoint below; set your own checkpoint to recollect.
+# Select compatible interpreters under runtime; see sketchssm/calibration/collection/README.md.
+schema_version: 1
+adapter: mamba2
+model:
+  name: Nemotron Nano 9B v2
+  family: mamba2
+  checkpoint: nvidia/NVIDIA-Nemotron-Nano-9B-v2
+  revision: 6533e8de2c68e4536bf7c411d7a3ce5734111476
+  tokenizer_revision: 6533e8de2c68e4536bf7c411d7a3ce5734111476
+geometry:
+  key_dim: 128
+  value_dim: 80
+  groups: 8
+  window: 16
+  erase: false
+basis:
+  rank: 79
+  ridge: 0.1
+allocation:
+  mean_ranks:
+  - 4
+  - 6
+  - 10
+  - 21
+  max_rank: 49
+dataset:
+  name: wikitext
+  subset: wikitext-2-raw-v1
+generation:
+  split: train
+  sequences: 520
+  prompt_tokens: 512
+  new_tokens: 256
+  temperature: 0
+  seed: 0
+  ignore_eos: true
+  chat_template: false
+  discard_first_window: true
+paired:
+  split: validation
+  sequences: 64
+  sequence_length: 256
+  block_start: 320
+  warmup_tokens: 128
+  objective: full-gram
+gradient:
+  loader: super_nvfp4
+runtime:
+  batch_size: 32
+  device: cuda
+  teacher_force: logits_processor
+  engine_kwargs:
+    async_scheduling: false
+    enable_flashinfer_autotune: false
+    max_num_batched_tokens: 8192

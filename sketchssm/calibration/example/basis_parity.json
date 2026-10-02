@@ -1,0 +1,58 @@
+[
+  {
+    "model": "nemotron_nano",
+    "shape": [
+      27,
+      8,
+      79,
+      128
+    ],
+    "bitwise_equal": true,
+    "max_abs": 0.0,
+    "sign_aligned_max_abs": 0.0,
+    "sign_aligned_relative_l2": 0.0,
+    "seconds": 1.505028007999499
+  },
+  {
+    "model": "nemotron_super",
+    "shape": [
+      40,
+      8,
+      63,
+      128
+    ],
+    "bitwise_equal": true,
+    "max_abs": 0.0,
+    "sign_aligned_max_abs": 0.0,
+    "sign_aligned_relative_l2": 0.0,
+    "seconds": 2.375530133000211
+  },
+  {
+    "model": "qwen_flash_next",
+    "shape": [
+      36,
+      16,
+      78,
+      128
+    ],
+    "bitwise_equal": true,
+    "max_abs": 0.0,
+    "sign_aligned_max_abs": 0.0,
+    "sign_aligned_relative_l2": 0.0,
+    "seconds": 2.7543926580001425
+  },
+  {
+    "model": "glm_flash",
+    "shape": [
+      34,
+      64,
+      60,
+      128
+    ],
+    "bitwise_equal": true,
+    "max_abs": 0.0,
+    "sign_aligned_max_abs": 0.0,
+    "sign_aligned_relative_l2": 0.0,
+    "seconds": 9.471542025999952
+  }
+]

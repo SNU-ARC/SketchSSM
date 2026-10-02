@@ -1,0 +1,41 @@
+{
+    "nf": {
+        "NF_MINB": 16,
+        "NF_UROWS": 2,
+        "NF_UBATCH": 4,
+        "NF_HEADS": 4,
+        "NF_SMAPS": 2,
+        "UW_BF16": 1,
+        "NF_LEAN": 1,
+        "NF_FFMA2": 1,
+        "NF_FASTSP": 0,
+        "NF_CONST_STRIDES": 1,
+        "NF_MMA": 0,
+        "NF_LANES8": 0,
+        "NF_ROWS": 1,
+        "NF_PF_ROWS": 8,
+        "NF_PF_FULL": 2,
+        "NF_PF_BULK": 0
+    },
+    "flush": {
+        "WARPS": 1,
+        "MINB": 9,
+        "QREG": 0,
+        "PREFETCH": 1,
+        "UNROLL": 1,
+        "UW_BF16": 1,
+        "FL_STAGES": 2,
+        "FL_HALF": 1,
+        "FL_PF_ROWS": 0,
+        "FL_GRID_HF": 0,
+        "FL_PF_BLOCKS": 2,
+        "FL_EARLY": 0,
+        "FL_CSMEM": 1,
+        "FL_XSMEM": 0,
+        "FL_PF_HEADS": 0,
+        "FL_Q0SMEM": 0,
+        "FL_OUTSMEM": 0,
+        "FL_STATS_FFMA2": 0,
+        "FL_ROW_LIST": 1
+    }
+}

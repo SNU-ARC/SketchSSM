@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "model": "Nemotron 3 Super",
+  "family": "mamba2",
+  "K": 128,
+  "V": 64,
+  "W": 16,
+  "groups": 8,
+  "erase": false,
+  "basis": "basis/omega.pt",
+  "curves": "statistics/paired_scores.pt",
+  "covariance": "statistics/covariance.pt",
+  "basis_fingerprint": "cc507f9e95ca36cf47aa3a6d00d37bd73958d89941dc4e92ffca0595ed6934c9",
+  "allocations": {
+    "2": {
+      "file": "allocations/g2.pt",
+      "dense_heads": 0,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 42
+    },
+    "3": {
+      "file": "allocations/g3.pt",
+      "dense_heads": 3,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 42
+    },
+    "5": {
+      "file": "allocations/g5.pt",
+      "dense_heads": 15,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 42
+    },
+    "9": {
+      "file": "allocations/g9.pt",
+      "dense_heads": 268,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 42
+    },
+    "20": {
+      "file": "allocations/g20.pt",
+      "dense_heads": 1452,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 42
+    }
+  },
+  "allocation_objective": "full-gram",
+  "allocation_policy": "fixed_rank_cost",
+  "inference_pivots": 4,
+  "files": {
+    "allocations/g2.pt": {
+      "bytes": 17917,
+      "sha256": "088b4ae5dc6303cf15793d134c412c80642af520a2a3db60335131afa64eff19"
+    },
+    "allocations/g20.pt": {
+      "bytes": 17989,
+      "sha256": "d3a8a9673ba642006bb89222683a3d34468dd39544d78afe5fbd993adb110980"
+    },
+    "allocations/g3.pt": {
+      "bytes": 17917,
+      "sha256": "5340f5d6fe8815534ee3bd0e62e205171b7ee25aace44ebb0c8d652da61d5ac9"
+    },
+    "allocations/g5.pt": {
+      "bytes": 17917,
+      "sha256": "2868f7f7000002af88ecb40d97489468ee8cc5c238dd66c53460577d9e9e3245"
+    },
+    "allocations/g9.pt": {
+      "bytes": 17917,
+      "sha256": "f8fc7a8c38c7bfc9123ba0027be2e3c2539b2483908938ad22d07e22ba8306e7"
+    },
+    "basis/omega.pt": {
+      "bytes": 10323739,
+      "sha256": "bba7ae7f3fd2fc0756677c25761512ad4f2a211034ba024aa62f81cdd8e97074"
+    },
+    "statistics/covariance.pt": {
+      "bytes": 1342180667,
+      "sha256": "90327494f6919b4b0e3b1e2d81870fd4de03f9212afd082f03757e93aa1aac91"
+    },
+    "statistics/paired_scores.pt": {
+      "bytes": 180923903,
+      "sha256": "2c28373e585fe72388ed20917c025a95594b29c86febae6acb10d94c9bf289c7"
+    },
+    "data/generation_tokens.pt": {
+      "bytes": 3197365,
+      "sha256": "81e98803d2684d520cab7e3973ee553436597c8cdd7f979242dc2c79ec74143b"
+    },
+    "data/allocation_tokens.pt": {
+      "bytes": 133807,
+      "sha256": "d9bff289bb498baaebdbd4be963a03931d03e0ab1be5f48c0185e3fc559252a9"
+    }
+  },
+  "generation_tokens": "data/generation_tokens.pt",
+  "allocation_tokens": "data/allocation_tokens.pt"
+}

@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "model": "Qwen3.8 Flash-Next",
+  "family": "gdn",
+  "K": 128,
+  "V": 128,
+  "W": 16,
+  "groups": 16,
+  "erase": true,
+  "basis": "basis/omega.pt",
+  "curves": "statistics/paired_scores.pt",
+  "covariance": "statistics/covariance.pt",
+  "basis_fingerprint": "274183ffd45bab89674d920376affe7caed5df288f92249aee0994312df2c552",
+  "allocations": {
+    "3": {
+      "file": "allocations/g3.pt",
+      "dense_heads": 0,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 60
+    },
+    "4": {
+      "file": "allocations/g4.pt",
+      "dense_heads": 0,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 60
+    },
+    "7": {
+      "file": "allocations/g7.pt",
+      "dense_heads": 1,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 60
+    },
+    "11": {
+      "file": "allocations/g11.pt",
+      "dense_heads": 2,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 60
+    },
+    "26": {
+      "file": "allocations/g26.pt",
+      "dense_heads": 287,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 60
+    }
+  },
+  "allocation_objective": "full-gram",
+  "allocation_policy": "fixed_rank_cost",
+  "inference_pivots": 4,
+  "files": {
+    "allocations/g11.pt": {
+      "bytes": 7813,
+      "sha256": "20a34ec332ebcf29fd5d6dad94d9e2a60b58ef2c6f6ee0a1405a98eb3e140d4e"
+    },
+    "allocations/g26.pt": {
+      "bytes": 7813,
+      "sha256": "88e7c9b08f8e1e18685e8443a41c17bfe0d4a9e6ed4a67741b9991aa793443f0"
+    },
+    "allocations/g3.pt": {
+      "bytes": 7741,
+      "sha256": "86d58013a5e25602df64774cf615aef2f6215f53d5ca1707a9cbda35d01e1ad6"
+    },
+    "allocations/g4.pt": {
+      "bytes": 7741,
+      "sha256": "e470dbdfd73a340490865e515761b5313b9aaff42fe40e32ebc8805a67475470"
+    },
+    "allocations/g7.pt": {
+      "bytes": 7741,
+      "sha256": "f696897cf988da20e41d984f0bf5a25b88960b843ac1cec837b60c08a7822462"
+    },
+    "basis/omega.pt": {
+      "bytes": 23004955,
+      "sha256": "22257ca2948540e5db10aea6bafd492c79cf9671963c5b42429501d684d64edb"
+    },
+    "statistics/covariance.pt": {
+      "bytes": 452988091,
+      "sha256": "31322c111dc3eae4c4bc78a5523a1a22bae1d35c3319bb4aefa16dcb7aa84e35"
+    },
+    "statistics/paired_scores.pt": {
+      "bytes": 75372031,
+      "sha256": "b495c90c3eb48607bd13234b6aa52d87183d643f11e49f63ef167153d46df612"
+    },
+    "data/generation_tokens.pt": {
+      "bytes": 3197365,
+      "sha256": "02a9ea95365344937d37e7110f6d65705838b0ca261fe2e600c2b5cdde262339"
+    },
+    "data/allocation_tokens.pt": {
+      "bytes": 133807,
+      "sha256": "2bcd831ccdac4bdf2a40fa8afceeaef0599c01c887e16e36929e8d7d6dd54160"
+    }
+  },
+  "generation_tokens": "data/generation_tokens.pt",
+  "allocation_tokens": "data/allocation_tokens.pt"
+}

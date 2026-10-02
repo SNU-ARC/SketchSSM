@@ -1,0 +1,45 @@
+schema_version: 1
+adapter: mamba2
+model:
+  name: Nemotron 3 Super
+  family: mamba2
+  checkpoint: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+  revision: ff433f5493e25d631c9f12b5d55c674229923d02
+  tokenizer_revision: ff433f5493e25d631c9f12b5d55c674229923d02
+geometry:
+  key_dim: 128
+  value_dim: 64
+  groups: 8
+  window: 16
+  erase: false
+basis:
+  rank: 63
+  ridge: 0.1
+allocation:
+  mean_ranks:
+  - 2
+  - 3
+  - 5
+  - 9
+  - 20
+  max_rank: 42
+dataset:
+  name: wikitext
+  subset: wikitext-2-raw-v1
+generation:
+  split: train
+  sequences: 520
+  prompt_tokens: 512
+  new_tokens: 256
+  temperature: 0
+  seed: 0
+  ignore_eos: true
+  chat_template: false
+  discard_first_window: true
+paired:
+  split: validation
+  sequences: 64
+  sequence_length: 256
+  block_start: 320
+  warmup_tokens: 128
+  objective: full-gram

@@ -1,0 +1,9 @@
+{
+    "step": {
+        "NF_MINB": 6,
+        "NF_UROWS": 8
+    },
+    "flush": {
+        "W1_MINB": 1
+    }
+}

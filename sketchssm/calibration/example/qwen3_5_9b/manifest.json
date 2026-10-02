@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "model": "Qwen3.5 9B",
+  "family": "gdn",
+  "K": 128,
+  "V": 128,
+  "W": 16,
+  "groups": 16,
+  "erase": true,
+  "basis_fingerprint": "7ecaff74f6b0e06b785fd63e9595e3c525bec0d64249b7e89f3253b6809c24ca",
+  "allocations": {
+    "3": {
+      "file": "allocations/g3.pt",
+      "dense_heads": 3,
+      "max_rank": 60
+    },
+    "4": {
+      "file": "allocations/g4.pt",
+      "dense_heads": 4,
+      "max_rank": 60
+    },
+    "7": {
+      "file": "allocations/g7.pt",
+      "dense_heads": 5,
+      "max_rank": 60
+    },
+    "11": {
+      "file": "allocations/g11.pt",
+      "dense_heads": 9,
+      "max_rank": 60
+    },
+    "26": {
+      "file": "allocations/g26.pt",
+      "dense_heads": 146,
+      "max_rank": 60
+    }
+  },
+  "files": {
+    "data/generation_tokens.pt": {
+      "bytes": 3197317,
+      "sha256": "0b26275921aa0f9a1fe9a4e8ef21aad485cc88071ec92919527211a8ea990deb"
+    },
+    "data/allocation_tokens.pt": {
+      "bytes": 133493,
+      "sha256": "6ffe38b3935ced3e60039757920006eb34050d029ef6816578f1a3f4fa4ad79c"
+    },
+    "statistics/covariance.pt": {
+      "bytes": 201329759,
+      "sha256": "8b63138315682e251e01676dc5c377e876fca8f21472775ff61517936f15f5f0"
+    },
+    "basis/omega.pt": {
+      "bytes": 15337441,
+      "sha256": "e93495c8fe43e3fbafb5a3d09caa57e3b9818e69c0dfc4dad7fb9a24e66a988e"
+    },
+    "statistics/paired_scores.pt": {
+      "bytes": 34466629,
+      "sha256": "862be8c216768f9a8ce8e8871744e941e28fb46d1042e20c6046a6419175369f"
+    },
+    "allocations/g3.pt": {
+      "bytes": 5709,
+      "sha256": "7337f83165f283bf45ca204568c73c487394b4e8524a5c5adac1abfd9e3b137d"
+    },
+    "allocations/g4.pt": {
+      "bytes": 5709,
+      "sha256": "e8adcacb70b0f0c992345686483b51c8fbdf4964510c75bbf7301a664d8abbd4"
+    },
+    "allocations/g7.pt": {
+      "bytes": 5709,
+      "sha256": "9b2a346ca07659c771235bc4e82d2e5f3a9ecbbea9e40ef1bbabd7ade7063a9a"
+    },
+    "allocations/g11.pt": {
+      "bytes": 5717,
+      "sha256": "4f8911fbe90333367a99e06e5aa95f95cc9fa3fbf1db5e87a85f3aa262797ef7"
+    },
+    "allocations/g26.pt": {
+      "bytes": 5717,
+      "sha256": "923bfaffeba86762b47d5c2b1b77a0424eacbd6bbf88156ab7ec663ec746a2dc"
+    }
+  },
+  "allocation_objective": "full-gram",
+  "allocation_policy": "fixed_rank_cost",
+  "inference_pivots": 4,
+  "collection_reused": false,
+  "adapter": "gdn",
+  "generation_tokens": "data/generation_tokens.pt",
+  "allocation_tokens": "data/allocation_tokens.pt",
+  "covariance": "statistics/covariance.pt",
+  "basis": "basis/omega.pt",
+  "curves": "statistics/paired_scores.pt"
+}

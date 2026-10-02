@@ -1,0 +1,10 @@
+{
+    "nf": {
+        "NF_MINB": 4
+    },
+    "flush": {
+        "FL_PF_BLOCKS": 0,
+        "FL_Q0SMEM": 1,
+        "FL_EARLY": 1
+    }
+}

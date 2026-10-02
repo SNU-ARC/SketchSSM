@@ -1,0 +1,59 @@
+# Collected with the NVFP4 checkpoint below; set your own checkpoint to recollect.
+# Select compatible interpreters under runtime; see sketchssm/calibration/collection/README.md.
+schema_version: 1
+adapter: gdn
+model:
+  name: Qwen3.8 Flash-Next
+  family: gdn
+  checkpoint: RadixArk/Qwen3.8-Flash-Next-NVFP4
+  revision: 7b719225242aacd3dbd3f9407468c2ee9a9d2594
+  tokenizer_revision: 7b719225242aacd3dbd3f9407468c2ee9a9d2594
+geometry:
+  key_dim: 128
+  value_dim: 128
+  groups: 16
+  window: 16
+  erase: true
+basis:
+  rank: 78
+  ridge: 0.1
+allocation:
+  mean_ranks:
+  - 3
+  - 4
+  - 7
+  - 11
+  - 26
+  max_rank: 60
+dataset:
+  name: wikitext
+  subset: wikitext-2-raw-v1
+generation:
+  split: train
+  sequences: 520
+  prompt_tokens: 512
+  new_tokens: 256
+  temperature: 0
+  seed: 0
+  ignore_eos: true
+  chat_template: false
+  discard_first_window: true
+paired:
+  split: validation
+  sequences: 64
+  sequence_length: 256
+  block_start: 320
+  warmup_tokens: 128
+  objective: full-gram
+gradient:
+  loader: qwen_nvfp4
+runtime:
+  batch_size: 32
+  device: cuda
+  teacher_force: logits_processor
+  engine_kwargs:
+    async_scheduling: false
+    enable_flashinfer_autotune: false
+    max_num_batched_tokens: 8192
+    additional_config:
+      gdn_prefill_backend: triton

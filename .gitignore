@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+outputs/
+*.pt
+# Calibration bundle data is not distributed; keep regenerated copies local.
+sketchssm/calibration/example/*/data/
+sketchssm/calibration/example/*/statistics/
+sketchssm/calibration/example/*/basis/
+sketchssm/calibration/example/*/allocations/
+validation_runs/
+.ruff_cache/
+.pytest_cache/
+sketchssm/kernels/aot/

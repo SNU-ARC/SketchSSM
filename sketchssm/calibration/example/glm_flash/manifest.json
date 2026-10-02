@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "model": "GLM 5.3 Flash",
+  "family": "kda",
+  "K": 128,
+  "V": 128,
+  "W": 16,
+  "groups": 64,
+  "erase": true,
+  "basis": "basis/omega.pt",
+  "curves": "statistics/paired_scores.pt",
+  "covariance": "statistics/covariance.pt",
+  "basis_fingerprint": "084e3b9b917e1afc64e978e6c55938ec058c2ae5854c5e45e7dce30206c6cb81",
+  "allocations": {
+    "3": {
+      "file": "allocations/g3.pt",
+      "dense_heads": 0,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 60
+    },
+    "4": {
+      "file": "allocations/g4.pt",
+      "dense_heads": 0,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 60
+    },
+    "7": {
+      "file": "allocations/g7.pt",
+      "dense_heads": 2,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 60
+    },
+    "12": {
+      "file": "allocations/g12.pt",
+      "dense_heads": 16,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 60
+    },
+    "28": {
+      "file": "allocations/g28.pt",
+      "dense_heads": 383,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 60
+    }
+  },
+  "allocation_objective": "full-gram",
+  "allocation_policy": "fixed_rank_cost",
+  "inference_pivots": 4,
+  "files": {
+    "allocations/g12.pt": {
+      "bytes": 9157,
+      "sha256": "4ad1876ce499afb3cb68a56a6c5b88e5096eddc1d589b60519dea52d7aa1d231"
+    },
+    "allocations/g28.pt": {
+      "bytes": 9157,
+      "sha256": "e2b2bd07597bc9d25c6780f1cd02b4d3574fdb4dd652da6aa2dd74979fccc485"
+    },
+    "allocations/g3.pt": {
+      "bytes": 9085,
+      "sha256": "fe237686f8a4a5d09bb96cd60459dffba9f0a878270a50c6d45ea33c75e3d799"
+    },
+    "allocations/g4.pt": {
+      "bytes": 9085,
+      "sha256": "0cc065a59d727f6ab01aa1c7bd5f89f879e5456593a7cbcae1ff5815c195ffc1"
+    },
+    "allocations/g7.pt": {
+      "bytes": 9085,
+      "sha256": "f276492e4c20f50795b04a75d0bef174102fe11a2fbaa2eaf5fd5b043eb124e9"
+    },
+    "basis/omega.pt": {
+      "bytes": 66848603,
+      "sha256": "291d3e8e507f3baaee581175d1102ff9b0de375cbb91c72489553f6f2994376c"
+    },
+    "statistics/covariance.pt": {
+      "bytes": 570428667,
+      "sha256": "6be73ed128618b8a924b9e0394a9cbdd998bd053dbcde2ce663d9e66d92e17f8"
+    },
+    "statistics/paired_scores.pt": {
+      "bytes": 139127945,
+      "sha256": "3c599e1d176e7375552c224708f3356b928c8a3c720483fcb8f09f49c50f0f1d"
+    },
+    "data/generation_tokens.pt": {
+      "bytes": 3197365,
+      "sha256": "a1ef777b9d1756e9fbfb7cacef38b455482e80e7e0752e8628278aac58f23c09"
+    },
+    "data/allocation_tokens.pt": {
+      "bytes": 133807,
+      "sha256": "b937e1bbcd9fc48b6c241b5be01aaa1fb8b11f7ffbc1b33cf7d28b820c14734a"
+    }
+  },
+  "generation_tokens": "data/generation_tokens.pt",
+  "allocation_tokens": "data/allocation_tokens.pt"
+}

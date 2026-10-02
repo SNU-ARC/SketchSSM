@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sketchssm"
+version = "0.1.7"
+description = "SketchSSM decode kernels and offline calibration"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+# The kernels are compiled at run time with NVRTC from the CUDA wheels torch
+# already depends on (nvidia-cuda-nvrtc, nvidia-cuda-runtime); no nvcc.
+dependencies = ["numpy>=1.26", "torch>=2.6"]
+
+[project.urls]
+Homepage = "https://github.com/SNU-ARC/SketchSSM"
+Repository = "https://github.com/SNU-ARC/SketchSSM"
+
+[project.optional-dependencies]
+calibration = ["PyYAML>=6", "transformers", "datasets", "safetensors", "huggingface-hub"]
+# Older name of the calibration extra.
+collection = ["sketchssm[calibration]"]
+test = ["pytest"]
+
+[project.scripts]
+sketchssm-calibrate = "sketchssm.calibration.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["sketchssm*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"sketchssm.kernels" = [
+    "csrc/*/*.cuh", "csrc/include/**/*", "configs/*/*.json", "aot/**/*",
+    "README.md",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: long-window sweeps and other expensive kernel cases (deselect with -m 'not slow')",
+]

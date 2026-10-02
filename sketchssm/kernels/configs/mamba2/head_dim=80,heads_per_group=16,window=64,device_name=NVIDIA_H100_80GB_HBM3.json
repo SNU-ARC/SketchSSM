@@ -1,0 +1,11 @@
+{
+    "nf": {
+        "NF_UBATCH": 1,
+        "NF_HEADS": 2,
+        "NF_SMAPS": 1,
+        "NF_PF_ROWS": 2
+    },
+    "flush": {
+        "WARPS": 2
+    }
+}

@@ -1,0 +1,60 @@
+# Collected with the NVFP4 checkpoint below; set your own checkpoint to recollect.
+# Select compatible interpreters under runtime; see sketchssm/calibration/collection/README.md.
+schema_version: 1
+adapter: kda
+model:
+  name: GLM 5.3 Flash
+  family: kda
+  checkpoint: RedHatAI/GLM-5.3-Flash-NVFP4
+  revision: 36c184c6cda000a481711306df5adde42f63321a
+  tokenizer_revision: 36c184c6cda000a481711306df5adde42f63321a
+geometry:
+  key_dim: 128
+  value_dim: 128
+  groups: 64
+  window: 16
+  erase: true
+basis:
+  rank: 60
+  ridge: 0.1
+allocation:
+  mean_ranks:
+  - 3
+  - 4
+  - 7
+  - 12
+  - 28
+  max_rank: 60
+dataset:
+  name: wikitext
+  subset: wikitext-2-raw-v1
+generation:
+  split: train
+  sequences: 520
+  prompt_tokens: 512
+  new_tokens: 256
+  temperature: 0
+  seed: 0
+  ignore_eos: true
+  chat_template: false
+  discard_first_window: true
+paired:
+  split: validation
+  sequences: 64
+  sequence_length: 256
+  block_start: 320
+  warmup_tokens: 128
+  objective: full-gram
+gradient:
+  loader: glm_nvfp4
+runtime:
+  batch_size: 32
+  device: cuda
+  teacher_force: trace_decode
+  engine_kwargs:
+    async_scheduling: false
+    enable_flashinfer_autotune: false
+    max_num_batched_tokens: 8192
+  environment:
+    VLLM_USE_V2_MODEL_RUNNER: '1'
+    VLLM_WORKER_MULTIPROC_METHOD: spawn

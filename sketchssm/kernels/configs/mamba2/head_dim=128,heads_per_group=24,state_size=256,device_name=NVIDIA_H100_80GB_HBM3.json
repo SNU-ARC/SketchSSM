@@ -1,0 +1,11 @@
+{
+    "nf": {
+        "NF_MINB": 10,
+        "NF_UBATCH": 1,
+        "NF_PF_ROWS": 0
+    },
+    "flush": {
+        "FL_STAGES": 4,
+        "FL_Q0SMEM": 1
+    }
+}

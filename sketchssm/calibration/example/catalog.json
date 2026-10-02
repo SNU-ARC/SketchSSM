@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "nemotron_nano",
+      "model": "Nemotron Nano 9B v2",
+      "ranks": [
+        4,
+        6,
+        10,
+        21
+      ],
+      "bytes": 1070742589
+    },
+    {
+      "id": "nemotron_super",
+      "model": "Nemotron 3 Super",
+      "ranks": [
+        2,
+        3,
+        5,
+        9,
+        20
+      ],
+      "bytes": 1536849138
+    },
+    {
+      "id": "qwen_flash_next",
+      "model": "Qwen3.8 Flash-Next",
+      "ranks": [
+        3,
+        4,
+        7,
+        11,
+        26
+      ],
+      "bytes": 554735098
+    },
+    {
+      "id": "glm_flash",
+      "model": "GLM 5.3 Flash",
+      "ranks": [
+        3,
+        4,
+        7,
+        12,
+        28
+      ],
+      "bytes": 779781956
+    }
+  ]
+}

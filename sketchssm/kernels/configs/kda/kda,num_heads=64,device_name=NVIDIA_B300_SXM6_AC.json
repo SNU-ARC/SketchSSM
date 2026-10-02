@@ -1,0 +1,10 @@
+{
+    "step": {
+        "S7_MINB": 6,
+        "NW": 4,
+        "S8_PREFETCH": 0
+    },
+    "flush": {
+        "K1_MINB": 3
+    }
+}

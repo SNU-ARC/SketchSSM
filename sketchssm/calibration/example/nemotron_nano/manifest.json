@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "model": "Nemotron Nano 9B v2",
+  "family": "mamba2",
+  "K": 128,
+  "V": 80,
+  "W": 16,
+  "groups": 8,
+  "erase": false,
+  "basis": "basis/omega.pt",
+  "curves": "statistics/paired_scores.pt",
+  "covariance": "statistics/covariance.pt",
+  "basis_fingerprint": "47aa0b8cb3edf4c8fb66005b42741049f02fafa4a4bc614dc37e7eef443b97db",
+  "allocations": {
+    "4": {
+      "file": "allocations/g4.pt",
+      "dense_heads": 12,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 49
+    },
+    "6": {
+      "file": "allocations/g6.pt",
+      "dense_heads": 30,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 49
+    },
+    "10": {
+      "file": "allocations/g10.pt",
+      "dense_heads": 230,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 49
+    },
+    "21": {
+      "file": "allocations/g21.pt",
+      "dense_heads": 775,
+      "rank_changes": 0,
+      "dense_changes": 0,
+      "max_rank": 49
+    }
+  },
+  "allocation_objective": "full-gram",
+  "allocation_policy": "fixed_rank_cost",
+  "inference_pivots": 4,
+  "files": {
+    "allocations/g10.pt": {
+      "bytes": 12997,
+      "sha256": "2644e4e40eaecadc9e08c327157313a0bcb58d970776356f029e8876ad6ff4db"
+    },
+    "allocations/g21.pt": {
+      "bytes": 12997,
+      "sha256": "0f7877c6bfd20ee9169f15264f5129ee9e02f1f42e5ed6f6c3617d5c9d4bb758"
+    },
+    "allocations/g4.pt": {
+      "bytes": 12925,
+      "sha256": "a68421051159c547c0327d16c69f75fdbf0bf1702a95cb5d17b2dfe48bdebe1d"
+    },
+    "allocations/g6.pt": {
+      "bytes": 12925,
+      "sha256": "159b05bd0d4859a5f3e7aa53ae5c19627c7c94ca8495cf4c7288a9cca00f6147"
+    },
+    "basis/omega.pt": {
+      "bytes": 8738587,
+      "sha256": "28db50c8f46811abea9355a00c490a435ef077f85a9800ca2460f82532467791"
+    },
+    "statistics/covariance.pt": {
+      "bytes": 905972795,
+      "sha256": "4dadfee55c9debc4e9338c7c65279620337f9bc27eacd72ff9f40fba687605bb"
+    },
+    "statistics/paired_scores.pt": {
+      "bytes": 152648191,
+      "sha256": "5a990806813dac4e88a14a8e68f52acaeb175d77685d77ba75b1ac0b098eed0b"
+    },
+    "data/generation_tokens.pt": {
+      "bytes": 3197365,
+      "sha256": "57602ceac3bb37365d786d3b51659148edb761a74bdea1ae1a08dbf2596ea108"
+    },
+    "data/allocation_tokens.pt": {
+      "bytes": 133807,
+      "sha256": "8bbff035baf6b6d3cf83c0b8b079764a5a76464ce655c6c01658b8fe918f9160"
+    }
+  },
+  "generation_tokens": "data/generation_tokens.pt",
+  "allocation_tokens": "data/allocation_tokens.pt"
+}
