@@ -68,6 +68,7 @@ from .interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsEagle3,
+    SupportsGDNReplaySSM,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -299,6 +300,7 @@ class Qwen3_5ForCausalLMBase(
     SupportsMRoPE,
     SupportsPP,
     SupportsSketchSSM,
+    SupportsGDNReplaySSM,
 ):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -457,7 +459,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class Qwen3_5ForConditionalGeneration(
-    Qwen3VLForConditionalGeneration, IsHybrid, SupportsSketchSSM
+    Qwen3VLForConditionalGeneration,
+    IsHybrid,
+    SupportsSketchSSM,
+    SupportsGDNReplaySSM,
 ):
     supports_multimodal_pruning = True
 

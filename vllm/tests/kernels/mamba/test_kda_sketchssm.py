@@ -168,3 +168,29 @@ def test_kda_sketch_cold_build_after_prefill(backend):
     sim.check_maps(2)
     for _ in range(17):
         sim.check_step([1, 0, 2])
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_kda_dense_heads_change_state_only_at_flush(backend):
+    """Dense heads read their BF16 state rows and keep the FP32 state fixed
+    between flushes; the flush rebuilds the BF16 rows from the folded state."""
+    sim = Sim(backend, 16, pages=4, seed=31)
+    sim.admit([1, 2, 3], [4, 2, 6])
+    dense = sim.tables.dense_heads.tolist()
+    assert dense == [0, 5]
+
+    def check_rows(pages):
+        for p in pages:
+            rows = sim.sketch.dense[sim.req[p]]
+            assert torch.equal(rows, sim.state[p, dense].bfloat16())
+
+    check_rows([1, 2, 3])
+    for t in range(40):
+        rows = [1, 2, 3] if t < 3 else [3, 1, 0, 2]
+        before = sim.state[:, dense].clone()
+        sim.check_step(rows)
+        for p in rows:
+            if p > 0 and sim.pos[p] != 0:
+                assert torch.equal(sim.state[p, dense], before[p])
+            elif p > 0:
+                check_rows([p])

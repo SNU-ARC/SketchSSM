@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pydantic
 import pytest
+import torch
 from huggingface_hub import ResolvedRevision
 from pydantic import ValidationError
 
@@ -109,6 +110,7 @@ def test_kda_recoverssm_derivation_is_revalidated():
         num_speculative_tokens=3,
         model_config=SimpleNamespace(
             supports_replayssm=True,
+            supports_gdn_replayssm=False,
             architecture="KimiLinearForCausalLM",
         ),
         mamba_config=SimpleNamespace(
@@ -153,12 +155,14 @@ def _sketchssm_config(**overrides):
             backend=MambaBackendEnum.TRITON, enable_stochastic_rounding=False
         ),
         cache_config=SimpleNamespace(
-            mamba_cache_mode="none", mamba_ssm_cache_dtype="float32"
+            mamba_cache_mode="none", mamba_ssm_cache_dtype="float32", sketchssm=None
         ),
         num_speculative_tokens=0,
         use_v2_model_runner=True,
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )
+    for method in ("_validate_sketchssm", "_check_sketchssm_kernels"):
+        setattr(config, method, getattr(VllmConfig, method).__get__(config))
     for path, value in overrides.items():
         *parents, name = path.split(".")
         target = config
@@ -187,6 +191,109 @@ def test_validate_sketchssm(overrides, match):
         return
     with pytest.raises(ValueError, match=match):
         VllmConfig._validate_sketchssm(config)
+
+
+def _kda_replayssm_config(**overrides):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            supports_replayssm=True,
+            supports_gdn_replayssm=False,
+            architecture="Glm5NextForConditionalGeneration",
+            dtype=torch.bfloat16,
+        ),
+        kv_transfer_config=None,
+        mamba_config=SimpleNamespace(
+            backend=MambaBackendEnum.TRITON, enable_stochastic_rounding=False
+        ),
+        cache_config=SimpleNamespace(
+            use_replayssm=True,
+            use_kda_recoverssm=False,
+            replayssm_buffer_len=16,
+            sketchssm=None,
+            mamba_cache_mode="none",
+            mamba_ssm_cache_dtype="float32",
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        num_speculative_tokens=0,
+        use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1
+        ),
+    )
+    for path, value in overrides.items():
+        *parents, name = path.split(".")
+        target = config
+        for parent in parents:
+            target = getattr(target, parent)
+        setattr(target, name, value)
+    config._validate_kda_replayssm = lambda: VllmConfig._validate_kda_replayssm(config)
+    return config
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({}, None),
+        ({"cache_config.sketchssm": "calibration.pt"}, "are exclusive"),
+        ({"mamba_config.backend": MambaBackendEnum.FLASHINFER}, "--mamba-backend"),
+        ({"cache_config.mamba_cache_mode": "align"}, "Mamba prefix caching"),
+        ({"num_speculative_tokens": 2}, "speculative decoding"),
+        ({"use_v2_model_runner": False}, "Model Runner V1"),
+        ({"cache_config.mamba_ssm_cache_dtype": "auto"}, "mamba-ssm-cache-dtype"),
+    ],
+)
+def test_validate_gdn_replayssm(overrides, match):
+    config = _sketchssm_config(**overrides)
+    config.model_config.supports_replayssm = True
+    config.model_config.supports_gdn_replayssm = True
+    config.cache_config.use_replayssm = True
+    config.cache_config.use_kda_recoverssm = True
+    if match is None:
+        VllmConfig.validate_mamba_cached_kernel(config)
+        assert config.cache_config.use_gdn_replayssm
+        assert not config.cache_config.use_kda_recoverssm
+        return
+    with pytest.raises(ValueError, match=match):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({}, None),
+        ({"model_config.architecture": "Glm5NextForCausalLM"}, None),
+        ({"cache_config.sketchssm": "calibration.pt"}, "--sketchssm"),
+        ({"cache_config.replayssm_buffer_len": 32}, "other than 16"),
+        ({"cache_config.mamba_cache_mode": "align"}, "Mamba prefix caching"),
+        ({"num_speculative_tokens": 1}, "speculative decoding"),
+        ({"use_v2_model_runner": False}, "Model Runner V1"),
+        ({"scheduler_config.async_scheduling": True}, "async scheduling"),
+        ({"cache_config.mamba_ssm_cache_dtype": "auto"}, "non-float32"),
+        ({"model_config.dtype": torch.float16}, "non-bfloat16"),
+        ({"parallel_config.tensor_parallel_size": 2}, "parallelism"),
+        ({"parallel_config.data_parallel_size": 2}, "parallelism"),
+    ],
+)
+def test_validate_kda_replayssm(overrides, match):
+    """GLM KDA --use-replayssm takes the W=16 window path, not Mamba2's."""
+    config = _kda_replayssm_config(**overrides)
+    if match is None:
+        VllmConfig.validate_mamba_cached_kernel(config)
+        assert not config.cache_config.use_kda_recoverssm
+        return
+    with pytest.raises(ValueError, match=f"KDA ReplaySSM .*{match}"):
+        VllmConfig._validate_kda_replayssm(config)
+
+
+def test_uses_kda_replayssm_only_for_glm_kda():
+    from vllm.config.vllm import _uses_kda_replayssm
+
+    config = _kda_replayssm_config()
+    assert _uses_kda_replayssm(config.model_config, config.cache_config)
+    config.cache_config.use_replayssm = False
+    assert not _uses_kda_replayssm(config.model_config, config.cache_config)
+    config = _kda_replayssm_config(**{"model_config.architecture": "NemotronH"})
+    assert not _uses_kda_replayssm(config.model_config, config.cache_config)
 
 
 def test_sketchssm_cache_config():

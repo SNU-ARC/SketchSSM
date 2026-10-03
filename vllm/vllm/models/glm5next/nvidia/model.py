@@ -64,6 +64,7 @@ from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MixtureOfExperts,
     SupportsPP,
+    SupportsReplaySSM,
     SupportsSketchSSM,
 )
 from vllm.model_executor.models.utils import (
@@ -932,7 +933,13 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForCausalLM(
-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsSketchSSM
+    nn.Module,
+    HasInnerState,
+    SupportsPP,
+    MixtureOfExperts,
+    IsHybrid,
+    SupportsReplaySSM,
+    SupportsSketchSSM,
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1016,6 +1023,7 @@ class Glm5NextForConditionalGeneration(
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsReplaySSM,
     SupportsSketchSSM,
 ):
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The

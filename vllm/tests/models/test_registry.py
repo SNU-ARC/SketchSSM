@@ -153,20 +153,24 @@ def test_registry_is_pp(model_arch, is_pp, init_cuda):
 
 @create_new_process_for_each_test()
 @pytest.mark.parametrize(
-    "model_arch,supported",
+    "model_arch,supported,gdn",
     [
-        # ReplaySSM is opt-in per model.
-        ("NemotronHForCausalLM", True),
-        ("KimiLinearForCausalLM", not current_platform.is_rocm()),
-        ("KimiK3ForConditionalGeneration", not current_platform.is_rocm()),
-        ("Mamba2ForCausalLM", False),
-        ("Zamba2ForCausalLM", False),
+        # ReplaySSM is opt-in per model; GDN models run it on SketchSSM.
+        ("NemotronHForCausalLM", True, False),
+        ("KimiLinearForCausalLM", not current_platform.is_rocm(), False),
+        ("KimiK3ForConditionalGeneration", not current_platform.is_rocm(), False),
+        ("Qwen3_5ForConditionalGeneration", True, True),
+        ("Qwen4ExpForConditionalGeneration", True, True),
+        ("Qwen3NextForCausalLM", False, False),
+        ("Mamba2ForCausalLM", False, False),
+        ("Zamba2ForCausalLM", False, False),
     ],
 )
-def test_registry_supports_replayssm(model_arch, supported):
+def test_registry_supports_replayssm(model_arch, supported, gdn):
     model_info = ModelRegistry._try_inspect_model_cls(model_arch)
     assert model_info is not None
     assert model_info.supports_replayssm is supported
+    assert model_info.supports_gdn_replayssm is gdn
 
 
 def test_lazy_modelinfo_package_hash_includes_submodules(tmp_path):

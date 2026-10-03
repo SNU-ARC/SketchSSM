@@ -1131,3 +1131,162 @@ kda_flush_finish(
     }
     }
 }
+
+// ── dense heads: one CTA (128 threads) per item (row, dense head); thread v owns value row v of the state, which sits
+//    in shared memory (16-byte chunks XOR-swizzled by row & 7).  FOLD (flush): the window's raw rows are applied in
+//    16-row blocks b in the WY form (FP32), rebased to ref_b = prefix row 16 b - 1:
+//      a_i = k^_i exp(p_i - ref_b), c_i = k^_i exp(ref_b - p_i), L[i][j] = beta_i <a_i, c_j> (j < i),
+//      X = (V - S A^T) T'', T''[w][i] = beta_w (I + L)^-1[i][w],  S' = (S + X C) diag(exp(p_{16 b + 15} - ref_b)),
+//    then out = S' q^.  Both phases then write the BF16 state rows Dense[meta[row]][j] the next window's steps read. ──
+#define DN_S 0                                  // state [128 v][32 chunks] float4, chunk c at c ^ (v & 7)
+#define DN_A (DN_S + 128 * 128 * 4)             // a [16][128] f32
+#define DN_C (DN_A + 16 * 128 * 4)              // c [16][128] f32
+#define DN_T (DN_C + 16 * 128 * 4)              // T'' [16 w][16 i] f32
+#define DN_L (DN_T + 16 * 16 * 4)               // L [16][16] f32
+#define DN_PW (DN_L + 16 * 16 * 4)              // exp(p_{16 b + 15} - ref_b) [128]
+#define DN_Q (DN_PW + 128 * 4)                  // q^ [128]
+#define DN_B (DN_Q + 128 * 4)                   // beta [16]
+#define DN_BYTES (DN_B + 16 * 4)
+__device__ __forceinline__ float4* dn_chunk(unsigned char* sm, int v, int c) { return (float4*)(sm + DN_S) + v * 32 + (c ^ (v & 7)); }
+
+template <bool FOLD>
+__global__ void __launch_bounds__(128)
+kda_dense_flush(const int* __restrict__ rows, int n_rows, const int* __restrict__ slots, const int* __restrict__ meta,
+    const int* __restrict__ heads, int NHd, float* __restrict__ state, long S0, long S1,
+    __nv_bfloat16* __restrict__ dense, long DS,
+    const __nv_bfloat16* __restrict__ kr, const __nv_bfloat16* __restrict__ vr,
+    const float* __restrict__ prefix_r, const float* __restrict__ beta_r, long RS,
+    const __nv_bfloat16* __restrict__ q_in, long QS, __nv_bfloat16* __restrict__ out, int H, float scale)
+{
+    extern __shared__ __align__(16) unsigned char dsm[];
+    float* sA = (float*)(dsm + DN_A); float* sC = (float*)(dsm + DN_C); float* sT = (float*)(dsm + DN_T);
+    float* sL = (float*)(dsm + DN_L); float* sPW = (float*)(dsm + DN_PW); float* sQ = (float*)(dsm + DN_Q);
+    float* sB = (float*)(dsm + DN_B);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int total = n_rows * NHd;
+    for (int idx = blockIdx.x; idx < total; idx += gridDim.x) {
+        const int row = rows[idx / NHd], j = idx % NHd;
+        if (row < 0) break;
+        const long page = slots[row];
+        if (page <= 0) continue;
+        const int h = heads[j];
+        float* sp = state + page * S0 + (long)h * S1;
+        __syncthreads();                                         // shared memory of the previous item is free
+        #pragma unroll 4
+        for (int i = 0; i < 32; ++i) {                           // rows 4 i + warp, chunk lane: coalesced
+            const int v = 4 * i + warp;
+            *dn_chunk(dsm, v, lane) = *(const float4*)(sp + v * 128 + 4 * lane);
+        }
+        if constexpr (FOLD) {
+            const long rp = page * RS, ring = (long)h * KDA_W;
+            for (int b = 0; b < NBLK; ++b) {
+                const long rb = ring + 16 * b;
+                float4 ref = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (b > 0) ref = *(const float4*)(page_ring(prefix_r, rp) + (rb - 1) * 128 + 4 * lane);
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) {                    // warp: rows 4 warp + r; lane: keys 4 lane .. + 3
+                    const int i = 4 * warp + r;
+                    const uint2 u = *(const uint2*)(page_ring(kr, rp) + (rb + i) * 128 + 4 * lane);
+                    float4 k = make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xffff0000u), __uint_as_float(u.y << 16), __uint_as_float(u.y & 0xffff0000u));
+                    const float kf = rsqrtf(warp_sum(k.x * k.x + k.y * k.y + k.z * k.z + k.w * k.w) + 1.e-6f);
+                    const float4 p = *(const float4*)(page_ring(prefix_r, rp) + (rb + i) * 128 + 4 * lane);
+                    const float4 d = make_float4(p.x - ref.x, p.y - ref.y, p.z - ref.z, p.w - ref.w);
+                    k.x *= kf; k.y *= kf; k.z *= kf; k.w *= kf;
+                    *(float4*)(sA + i * 128 + 4 * lane) = make_float4(k.x * expf(d.x), k.y * expf(d.y), k.z * expf(d.z), k.w * expf(d.w));
+                    *(float4*)(sC + i * 128 + 4 * lane) = make_float4(k.x * expf(-d.x), k.y * expf(-d.y), k.z * expf(-d.z), k.w * expf(-d.w));
+                    if (i == 15) *(float4*)(sPW + 4 * lane) = make_float4(expf(d.x), expf(d.y), expf(d.z), expf(d.w));
+                }
+                if (t < 16) sB[t] = page_ring(beta_r, rp)[rb + t];
+                if (b == 0) {                                    // q^ (warp 0)
+                    if (warp == 0) {
+                        const uint2 u = *(const uint2*)(q_in + (long)row * QS + h * 128 + 4 * lane);
+                        float4 q = make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xffff0000u), __uint_as_float(u.y << 16), __uint_as_float(u.y & 0xffff0000u));
+                        const float qf = rsqrtf(warp_sum(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) + 1.e-6f) * scale;
+                        *(float4*)(sQ + 4 * lane) = make_float4(q.x * qf, q.y * qf, q.z * qf, q.w * qf);
+                    }
+                }
+                __syncthreads();
+                // L[i][jj] = beta_i <a_i, c_jj> for jj < i: thread t -> pairs t, t + 128 of the 16 x 16 grid
+                for (int e = t; e < 256; e += 128) {
+                    const int i = e >> 4, jj = e & 15;
+                    float acc = 0.f;
+                    if (jj < i) {
+                        const float4* a4 = (const float4*)(sA + i * 128);
+                        const float4* c4 = (const float4*)(sC + jj * 128);
+                        #pragma unroll 8
+                        for (int k = 0; k < 32; ++k) {
+                            const float4 x = a4[(k + t) & 31], y = c4[(k + t) & 31];
+                            acc = fmaf(x.x, y.x, fmaf(x.y, y.y, fmaf(x.z, y.z, fmaf(x.w, y.w, acc))));
+                        }
+                        acc *= sB[i];
+                    }
+                    sL[e] = acc;
+                }
+                __syncthreads();
+                if (t < 16) {                                    // column t of (I + L)^-1; T''[t][i] = beta_t x_i
+                    float x[16];
+                    #pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        float v = (i == t) ? 1.f : 0.f;
+                        #pragma unroll
+                        for (int jj = 0; jj < i; ++jj) v = fmaf(-sL[i * 16 + jj], x[jj], v);
+                        x[i] = v;
+                    }
+                    const float bt = sB[t];
+                    #pragma unroll
+                    for (int i = 0; i < 16; ++i) sT[t * 16 + i] = bt * x[i];
+                }
+                __syncthreads();
+                // thread v: P = S_v A^T, X = (V_v - P) T'', S_v = (S_v + X C) diag(PW) (+ out on the last block)
+                const int v = t;
+                float P[16];
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) P[i] = 0.f;
+                #pragma unroll 2
+                for (int c = 0; c < 32; ++c) {
+                    const float4 s4 = *dn_chunk(dsm, v, c);
+                    #pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        const float4 a4 = *(const float4*)(sA + i * 128 + 4 * c);
+                        P[i] = fmaf(s4.x, a4.x, fmaf(s4.y, a4.y, fmaf(s4.z, a4.z, fmaf(s4.w, a4.w, P[i]))));
+                    }
+                }
+                #pragma unroll
+                for (int w = 0; w < 16; ++w) P[w] = __bfloat162float(page_ring(vr, rp)[(rb + w) * 128 + v]) - P[w];
+                float X[16];
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    float acc = 0.f;
+                    #pragma unroll
+                    for (int w = 0; w < 16; ++w) acc = fmaf(P[w], sT[w * 16 + i], acc);
+                    X[i] = acc;
+                }
+                float o = 0.f;
+                #pragma unroll 2
+                for (int c = 0; c < 32; ++c) {
+                    float4 s4 = *dn_chunk(dsm, v, c);
+                    #pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        const float4 c4 = *(const float4*)(sC + i * 128 + 4 * c);
+                        s4.x = fmaf(X[i], c4.x, s4.x); s4.y = fmaf(X[i], c4.y, s4.y); s4.z = fmaf(X[i], c4.z, s4.z); s4.w = fmaf(X[i], c4.w, s4.w);
+                    }
+                    const float4 pw = *(const float4*)(sPW + 4 * c);
+                    s4.x *= pw.x; s4.y *= pw.y; s4.z *= pw.z; s4.w *= pw.w;
+                    *dn_chunk(dsm, v, c) = s4;
+                    const float4 q4 = *(const float4*)(sQ + 4 * c);
+                    o = fmaf(s4.x, q4.x, fmaf(s4.y, q4.y, fmaf(s4.z, q4.z, fmaf(s4.w, q4.w, o))));
+                }
+                if (b == NBLK - 1) out[((long)row * H + h) * 128 + v] = __float2bfloat16_rn(o);
+                __syncthreads();
+            }
+        }
+        __nv_bfloat16* pd = dense + (long)meta[row] * DS + (long)j * 16384;
+        #pragma unroll 4
+        for (int i = 0; i < 32; ++i) {
+            const int v = 4 * i + warp;
+            const float4 s4 = *dn_chunk(dsm, v, lane);
+            if constexpr (FOLD) *(float4*)(sp + v * 128 + 4 * lane) = s4;
+            *(uint2*)(pd + v * 128 + 4 * lane) = make_uint2(pack_bf16(s4.x, s4.y), pack_bf16(s4.z, s4.w));
+        }
+    }
+}

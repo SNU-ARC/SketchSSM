@@ -34,6 +34,7 @@ from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsGDNReplaySSM,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -639,6 +640,7 @@ class Qwen4ExpForCausalLM(
     Qwen4ExpMixtureOfExperts,
     IsHybrid,
     SupportsSketchSSM,
+    SupportsGDNReplaySSM,
 ):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],

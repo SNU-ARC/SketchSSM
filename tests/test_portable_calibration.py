@@ -163,9 +163,6 @@ class PortableCalibrationTests(unittest.TestCase):
                                torch.load(root / 'old.pt', weights_only=True))
 
 
-@unittest.skipIf(any(missing_files(EXAMPLES / b) for b in BUNDLES),
-                 'calibration bundle data is not present (it is not distributed; see '
-                 'sketchssm/calibration/example/README.md to regenerate it)')
 def make_erase_calibration(window=16):
     """GDN-like portable calibration (erase, K=V=16) with verified tables at its window."""
     generator = torch.Generator().manual_seed(11)
@@ -233,6 +230,9 @@ class ServingWindowTests(unittest.TestCase):
             self.assertTrue(torch.equal(wide['m_table'], calibration.select(c, G)['m_table']))
 
 
+@unittest.skipIf(any(missing_files(EXAMPLES / b) for b in BUNDLES),
+                 'calibration bundle data is not present (it is not distributed; see '
+                 'sketchssm/calibration/example/README.md to regenerate it)')
 class PublicBundleParityTests(unittest.TestCase):
     """Every configured mean rank of the four public bundles (under a minute on CPU)."""
 

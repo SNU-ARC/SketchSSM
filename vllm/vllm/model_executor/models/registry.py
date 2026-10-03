@@ -50,6 +50,7 @@ from .interfaces import (
     is_attention_free,
     is_hybrid,
     requires_raw_input_tokens,
+    supports_gdn_replayssm,
     supports_mamba_prefix_caching,
     supports_multimodal,
     supports_multimodal_encoder_tp_data,
@@ -874,6 +875,7 @@ class _ModelInfo:
     has_noops: bool
     supports_mamba_prefix_caching: bool
     supports_replayssm: bool
+    supports_gdn_replayssm: bool
     supports_sketchssm: bool
     supports_transcription: bool
     supports_transcription_only: bool
@@ -904,6 +906,7 @@ class _ModelInfo:
             is_hybrid=is_hybrid(model),
             supports_mamba_prefix_caching=supports_mamba_prefix_caching(model),
             supports_replayssm=supports_replayssm(model),
+            supports_gdn_replayssm=supports_gdn_replayssm(model),
             supports_sketchssm=supports_sketchssm(model),
             supports_transcription=supports_transcription(model),
             supports_transcription_only=(

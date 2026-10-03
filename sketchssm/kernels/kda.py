@@ -149,6 +149,7 @@ _FLUSH_PROBES = (
     ("scratch", "SCRATCH_F"),
     ("ablate", "K1_ABLATE"),
     ("window", "KDA_W"),
+    ("dense_smem", "DN_BYTES"),
     *((f"smem{m}", f"Smem<{m}, false>::BYTES") for m in _MMAX),
     *((f"smemb{m}", f"Smem<{m}, true>::BYTES") for m in _MMAX),
     *((f"minb{m}", f"K1_MINB_OF({m})") for m in _MMAX),
@@ -161,6 +162,7 @@ def _main_name(mmax: int, flush: bool) -> str:
 
 
 _FINISH = "kda_flush_finish<__nv_bfloat16>"
+_DENSE = ("kda_dense_flush<false>", "kda_dense_flush<true>")
 
 
 def _window_define(config: dict, window: int) -> dict:
@@ -174,7 +176,7 @@ def step_spec(config: dict, window: int) -> kn.Spec:
 
 
 def flush_spec(config: dict, window: int) -> kn.Spec:
-    names = [_main_name(m, f) for m in _MMAX for f in (False, True)] + [_FINISH]
+    names = [_main_name(m, f) for m in _MMAX for f in (False, True)] + [_FINISH, *_DENSE]
     return kn.Spec.make("kda_flush", "kda/kda_sketch_flush.cuh", _window_define(config, window),
                         names, (), _FLUSH_PROBES)  # fmt: skip
 
@@ -285,17 +287,22 @@ def _input_row_stride(x: torch.Tensor, B: int, H: int, vec: bool, name: str) -> 
 
 _STEP_SIG = drv.Signature(
     ["Q", "i"] + ["Q"] * 5 + ["5I"] + ["Q"] * 6 + ["q", "q"] + ["Q"] * 10 + ["q", "Q", "i", "i", "f"]
+    + ["Q", "q", "Q"]
 )
 _MAIN_SIG = drv.Signature(
     ["i", "i", "i", f"{drv.TENSOR_MAP_BYTES}s", "Q", "q", "q", "Q", "i", "Q", "Q", "128i",
      "i", "i"] + ["Q"] * 7 + ["q", "Q", "q", "Q", "f", "Q"]
 )  # fmt: skip
 _FINISH_SIG = drv.Signature(["Q", "i", "Q", "128i", "i", "i", "i"] + ["Q"] * 5)
+_DENSE_SIG = drv.Signature(
+    ["Q", "i", "Q", "Q", "Q", "i", "Q", "q", "q", "Q", "q"] + ["Q"] * 4
+    + ["q", "Q", "q", "Q", "i", "f"]
+)  # fmt: skip
 
 
 def _step_launch(k: kn.Kernel, heads, q, kk, v, gate, beta, a_log, bias, slots, meta, pos,
                  state, S0, S1, latch, phi, ranks, kr, vr, br, prefix_r, fr, ur, dr, out,
-                 H, G, scale) -> None:  # fmt: skip
+                 H, G, scale, dense, dense_rows) -> None:  # fmt: skip
     """The step launch (``step`` of the former C++ launcher)."""
     W = k.probes["window"]
     _check(G % 8 == 0, "kda step: padded rank must be a multiple of 8")
@@ -308,6 +315,10 @@ def _step_launch(k: kn.Kernel, heads, q, kk, v, gate, beta, a_log, bias, slots, 
            "kda step: contiguous int32 heads, slots, meta and pos")  # fmt: skip
     _check(state.dtype == torch.float32 and state.stride(2) == 128 and state.stride(3) == 1,
            "kda step: fp32 [page][H][128][128] state")  # fmt: skip
+    _check(dense.dtype == torch.bfloat16 and dense.is_contiguous()
+           and dense.shape[2:] == (128, 128) and dense_rows.dtype == torch.int32
+           and dense_rows.is_contiguous(),
+           "kda step: bf16 [reqs][dense heads][128][128] dense state rows, int32 dense row table")  # fmt: skip
     RS = _ring_page_stride((kr, vr, br, prefix_r, ur, dr), H, W)
     B, NH = q.shape[0], heads.shape[0]
     if NH == 0 or B == 0:
@@ -324,7 +335,7 @@ def _step_launch(k: kn.Kernel, heads, q, kk, v, gate, beta, a_log, bias, slots, 
         meta.data_ptr(), pos.data_ptr(), state.data_ptr(), S0, S1, latch.data_ptr(),
         phi.data_ptr(), ranks.data_ptr(), kr.data_ptr(), vr.data_ptr(), br.data_ptr(),
         prefix_r.data_ptr(), fr.data_ptr(), ur.data_ptr(), dr.data_ptr(), RS,
-        out.data_ptr(), H, G, scale,
+        out.data_ptr(), H, G, scale, dense.data_ptr(), dense.stride(0), dense_rows.data_ptr(),
     )  # fmt: skip
     drv.launch(k.function("kda_step_kernel", _STEP_SIG), _STEP_SIG, (B, (NH + nw - 1) // nw, 1),
                (32 * nw, 1, 1), 0, drv.current_stream(q.device.index), args)  # fmt: skip
@@ -408,9 +419,11 @@ def _flush_launches(
     scale: float,
     flush: bool,
 ) -> None:
-    """The flush (or cold build): ``flush_main`` per rank bucket, then
-    ``flush_finish`` (the former C++ launchers)."""
+    """The flush (or cold build): the dense heads' fold and BF16 state rows,
+    ``flush_main`` per rank bucket, then ``flush_finish`` (the former C++
+    launchers)."""
     t = sketch.tables
+    _dense_launch(state, rings, rows, slots, meta, sketch, q, out, scale, flush)
     if not t.num_sketch_heads:
         return
     assert rows.is_contiguous() and rows.dtype == torch.int32
@@ -489,6 +502,52 @@ def _flush_launches(
                (min((cap * n_all + 3) // 4, sms * 16), 1, 1), (128, 1, 1), 0, stream, args)
 
 
+def _dense_launch(state, rings, rows, slots, meta, sketch, q, out, scale, flush) -> None:
+    """Dense heads of the listed rows: (flush) fold the window into the FP32
+    state exactly and write the output; then their BF16 state rows."""
+    t = sketch.tables
+    nd, cap = t.num_dense_heads, rows.numel()
+    if nd == 0 or cap == 0:
+        return
+    dense, heads = sketch.dense, t.dense_heads_d
+    _check(dense.dtype == torch.bfloat16 and dense.is_contiguous() and dense.shape[1] >= nd
+           and dense.shape[2:] == (128, 128),
+           "kda flush: bf16 [reqs][dense heads][128][128] dense state rows")  # fmt: skip
+    _check(heads.dtype == torch.int32 and heads.is_contiguous() and heads.numel() == nd,
+           "kda flush: int32 dense head list")  # fmt: skip
+    _check(state.dtype == torch.float32 and state.stride(2) == 128 and state.stride(3) == 1,
+           "kda flush: fp32 [page][H][128][128] state with dense inner strides")  # fmt: skip
+    _check(all(x.dtype == torch.int32 and x.is_contiguous() for x in (rows, slots, meta)),
+           "kda flush: contiguous int32 rows, slots and meta")  # fmt: skip
+    k = _flush_ext(t.num_heads, t.window)
+    H = t.num_heads
+    RS, QS = 0, 0
+    kr, vr, prefix_r, beta_r = rings.k, rings.v, rings.prefix, rings.beta
+    if flush:
+        RS = _ring_page_stride((kr, vr, prefix_r, beta_r), H, k.probes["window"])
+        _check(q.dtype == torch.bfloat16 and q.dim() == 3 and q.shape[1] == H
+               and q.stride(2) == 1 and q.stride(1) == 128 and q.data_ptr() % 8 == 0
+               and out.dtype == torch.bfloat16 and out.is_contiguous(),
+               "kda flush: bf16 [B][H][128] q (dense rows) and contiguous out")  # fmt: skip
+        QS = q.stride(0) if q.shape[0] > 1 else H * 128
+    device = state.device.index
+    sms = drv.device_attribute(device, drv.DEV_MULTIPROCESSOR_COUNT)
+    fn = k.function(_DENSE[int(flush)], _DENSE_SIG)
+    smem = k.probes["dense_smem"]
+    occ = _main_configured.get(fn)
+    if occ is None:
+        drv.set_max_dynamic_smem(fn, smem)
+        occ = _main_configured[fn] = max(1, drv.occupancy(fn, 128, smem))
+    args = (
+        rows.data_ptr(), cap, slots.data_ptr(), meta.data_ptr(), heads.data_ptr(), nd,
+        state.data_ptr(), state.stride(0), state.stride(1), dense.data_ptr(), dense.stride(0),
+        kr.data_ptr(), vr.data_ptr(), prefix_r.data_ptr(), beta_r.data_ptr(), RS, q.data_ptr(),
+        QS, out.data_ptr(), H, scale,
+    )  # fmt: skip
+    drv.launch(fn, _DENSE_SIG, (min(cap * nd, sms * occ), 1, 1), (128, 1, 1), smem,
+               drv.current_stream(device), args)  # fmt: skip
+
+
 def _check_window(rings: KDARings, sketch: KDASketch) -> None:
     w = sketch.tables.window
     assert rings.window == w and sketch.f.shape[-1] == w
@@ -511,7 +570,8 @@ def kda_cold_build(
     scratch: torch.Tensor,
     null_block_id: int = 0,
 ) -> None:
-    """Build the sketch of each listed row from its state.
+    """Build the sketch (and the dense heads' BF16 state rows) of each listed
+    row from its state.
 
     The rows' next decode step must be at window position 0.
 
@@ -558,9 +618,11 @@ def kda_decode(
 ) -> None:
     """One SketchSSM decode step of a KDA layer.
 
-    Every row runs the step (sketch readout and ring append; dense heads
-    update the state). Rows at ``pos == W - 1`` then fold the window into
-    the state exactly, rebuild their sketch and overwrite their output.
+    Every row runs the step (ring append; sketch heads read their sketch,
+    dense heads their BF16 state rows and the window, keeping FP32 replay
+    rows in their u / d ring bytes). Only rows at ``pos == W - 1`` change
+    the FP32 state: they fold the window into it exactly, rebuild the sketch
+    and the dense heads' BF16 state rows, and write their output.
     q and k are l2-normalized in the kernels, the gate is
     ``-5 sigmoid(exp(A_log) (g + dt_bias))`` and beta is ``sigmoid(beta)``.
 
@@ -601,7 +663,7 @@ def kda_decode(
         _step_ext(h, t.window), t.heads_step, q, k, v, g, beta, a_log, bias, slots,
         meta, pos, state, state.stride(0), state.stride(1), sketch.u, sketch.phi,
         t.ranks, rings.k, rings.v, rings.beta, rings.prefix, sketch.f, rings.u_ring,
-        rings.d_ring, out, h, t.rank_cap, scale,
+        rings.d_ring, out, h, t.rank_cap, scale, sketch.dense, t.dense_rows,
     )  # fmt: skip
     if has_flush_rows:
         _flush_launches(

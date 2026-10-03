@@ -140,7 +140,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 self.compilation_config.max_cudagraph_capture_size,
             )
 
-        self.use_sketchssm = vllm_config.cache_config.sketchssm is not None
+        self.use_sketchssm = vllm_config.cache_config.uses_gdn_sketchssm
         self.sketchssm_window = vllm_config.cache_config.replayssm_buffer_len
         if self.use_sketchssm:
             self.decode_sketchssm_window_pos_d = torch.empty(

@@ -36,8 +36,11 @@ one budget (`python -m sketchssm.calibration export`, then no
 | `--replayssm-buffer-len W` | SketchSSM window (flush every W steps, default 16); the CUDA kernels take any multiple of 16. Tuned knobs are per window (`--window` in the tuners); without a file for W the W=16 knobs, then the GPU's defaults, are used. |
 | `VLLM_SKETCHSSM_USE_CUDA=0` | force the portable Triton kernels. |
 
-`--use-replayssm` alone is upstream ReplaySSM for Mamba-2; Gated DeltaNet and
-KDA layers use their window rings only for SketchSSM. See
+`--use-replayssm` alone (no `--sketchssm`) runs ReplaySSM, the paper's
+full-state baseline, with window W=16: upstream ReplaySSM for Mamba-2 (Model
+Runner V1); for Gated DeltaNet the SketchSSM kernels with every head dense; for
+KDA (GLM 5.3 Flash) an exact window decode, which also needs synchronous
+scheduling (`--no-async-scheduling`). See
 [`docs/features/sketchssm.md`](docs/features/sketchssm.md).
 
 | Model | Calibration (Hugging Face) | Collected with |
@@ -63,8 +66,9 @@ python -m sketchssm.kernels.tools.benchmark_mamba2 \
 
 Outputs do not depend on the knobs.
 
-Model-level measurements (every recurrent kernel of real decode steps, as in
-the paper) are in the parent repository's `benchmarks/`.
+Model-level measurements (accuracy, decode throughput and per-layer recurrent
+decode latency in vLLM, as in the paper) are in the parent repository's
+`evaluation/`.
 
 ## Status
 

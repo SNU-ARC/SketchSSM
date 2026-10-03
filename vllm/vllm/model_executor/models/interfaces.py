@@ -1198,6 +1198,33 @@ def supports_replayssm(
 
 
 @runtime_checkable
+class SupportsGDNReplaySSM(SupportsReplaySSM, Protocol):
+    """The interface for models whose Gated DeltaNet layers run ReplaySSM on
+    the SketchSSM decode kernels with dense heads (no calibration).
+
+    This is currently experimental.
+    """
+
+    supports_gdn_replayssm: ClassVar[Literal[True]] = True
+
+
+@overload
+def supports_gdn_replayssm(
+    model: type[object],
+) -> TypeIs[type[SupportsGDNReplaySSM]]: ...
+
+
+@overload
+def supports_gdn_replayssm(model: object) -> TypeIs[SupportsGDNReplaySSM]: ...
+
+
+def supports_gdn_replayssm(
+    model: type[object] | object,
+) -> TypeIs[type[SupportsGDNReplaySSM]] | TypeIs[SupportsGDNReplaySSM]:
+    return getattr(model, "supports_gdn_replayssm", False)
+
+
+@runtime_checkable
 class SupportsSketchSSM(Protocol):
     """The interface for models that support SketchSSM decode (experimental)."""
 

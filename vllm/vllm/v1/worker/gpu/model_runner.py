@@ -1070,7 +1070,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return cuda_graph_size
 
+    def _kda_replayssm_groups(self) -> list[tuple[int, list[Any]]]:
+        """KDA layers with a ReplaySSM window pool, by KV cache group."""
+        groups = getattr(self, "_kda_replayssm_group_layers", None)
+        if groups is None:
+            context = self.compilation_config.static_forward_context
+            groups = []
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                layers = [
+                    context[name]
+                    for name in group.layer_names
+                    if getattr(context.get(name), "kda_replayssm", None) is not None
+                ]
+                if layers:
+                    groups.append((group_id, layers))
+            self._kda_replayssm_group_layers = groups
+        return groups
+
+    def reset_kda_replayssm(self) -> None:
+        """Drop window ownership left by warmup and graph capture."""
+        if not self.cache_config.use_replayssm:
+            return
+        for _, layers in self._kda_replayssm_groups():
+            for layer in layers:
+                layer.kda_replayssm.reset()
+
+    def _release_kda_replayssm(self, req_id: str, *, materialize: bool = False):
+        """Discard the windows of a request's freed state pages, or fold them
+        into the pages first when a streaming prompt continues."""
+        if not self.cache_config.use_replayssm:
+            return
+        req_idx = self.req_states.req_id_to_index.get(req_id)
+        if req_idx is None:
+            return
+        for group_id, layers in self._kda_replayssm_groups():
+            count = int(self.block_tables.num_blocks.np[group_id, req_idx])
+            ids = self.block_tables.block_tables[group_id].gpu[req_idx, :count]
+            for layer in layers:
+                if materialize:
+                    initial = torch.ones_like(ids, dtype=torch.bool)
+                    layer.kda_replayssm.before_prefill(layer.kv_cache[1], ids, initial)
+                else:
+                    layer.kda_replayssm.release_finished(ids)
+
     def _remove_request(self, req_id: str) -> bool:
+        self._release_kda_replayssm(req_id)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -1122,6 +1166,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
 
+            if new_req_data.num_computed_tokens > 0:
+                # A continuing streaming prompt keeps its SSM state pages.
+                self._release_kda_replayssm(req_id, materialize=True)
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
             # with the updated prompt_token_ids and mm_features.

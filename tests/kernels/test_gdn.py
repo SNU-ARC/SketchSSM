@@ -5,6 +5,8 @@
 Per request, the oracle solves the four-pivot residual-diagonal coefficient
 system of the window-start state directly, tracks the projected erase history,
 and applies each flush as the exact sequence of delta-rule erases and updates.
+Dense heads read the BF16 rows of the window-start state; their flush erases
+the rounding residual of those rows.
 Each step reads the kernels' own BF16 ring history, so every step is checked
 against the exact arithmetic of its inputs. Tolerances are the reference check's.
 """
@@ -205,9 +207,10 @@ class Harness:
                     hq = s0[h, :, :m].to(torch.bfloat16).double() @ x
                     dc = bt * (v[bi, h] - at * sk)
                     r.F[h].append(ft.to(torch.bfloat16).double())
-                else:
-                    hq = s0[h] @ qh
-                    dc = bt * (v[bi, h] - at * (tot * (s0[h] @ kh) + sk))
+                else:  # dense: the BF16 rows of s0
+                    s0b = s0[h].to(torch.bfloat16).double()
+                    hq = s0b @ qh
+                    dc = bt * (v[bi, h] - at * (tot * (s0b @ kh) + sk))
                 expected[bi, h] = at * (tot * hq + sq) + dc * ktq
                 expected_d[s, h] = dc
                 if t == W - 1:
@@ -215,14 +218,16 @@ class Harness:
                     ds = torch.cat([ds, dc[None]], 0)
                     gates = torch.cat([g, at.log()[None]], 0)
                     alphas = gates.exp()
-                    boundary = s0[h].clone()
-                    if m:
-                        betas = torch.cat([br[r.meta, h, :t], bt[None]], 0)
-                        for st in range(W):
-                            erase = (boundary @ keys[st])[:, None] * keys[st][None, :]
-                            boundary = alphas[st] * (boundary - betas[st] * erase)
-                    else:
-                        boundary = boundary * alphas.prod()
+                    # Dense heads stored full updates from their BF16 rows:
+                    # only the rounding residual is erased.
+                    s0b = s0[h].to(torch.bfloat16).double()
+                    boundary = s0[h].clone() if m else s0[h] - s0b
+                    betas = torch.cat([br[r.meta, h, :t], bt[None]], 0)
+                    for st in range(W):
+                        erase = (boundary @ keys[st])[:, None] * keys[st][None, :]
+                        boundary = alphas[st] * (boundary - betas[st] * erase)
+                    if not m:
+                        boundary = boundary + s0b * alphas.prod()
                     pre = gates.cumsum(0)
                     replay = (pre[-1] - pre).exp()
                     expected_state[s, h] = boundary + (ds * replay[:, None]).T @ keys

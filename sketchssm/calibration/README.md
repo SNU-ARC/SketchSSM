@@ -35,8 +35,9 @@ without editing the common core. See [adapter selection and extension](adapters/
 
 Omega is shared by group; rank allocation remains per head. Gradients weight
 allocation scores, not Omega. Full-Gram scores are independent of the P4
-approximation used during inference. Allocation uses the established fixed
-rank/dense weights; inference traffic is reported separately.
+approximation used during inference. A rank costs K+V (+W for GDN/KDA) and a
+dense head K·V: the ratio of their non-flush BF16 reads (a dense head reads BF16
+rows of its full state, rebuilt at each flush), so the budget is a traffic budget.
 
 ## Existing examples
 

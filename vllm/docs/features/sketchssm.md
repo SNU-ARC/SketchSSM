@@ -1,6 +1,6 @@
 # SketchSSM
 
-SketchSSM speeds up the decode of recurrent (state space and linear attention) layers. Each request decodes in windows of `W` steps (`--replayssm-buffer-len`, 16 by default). The last step of a window flushes the window into the exact recurrent state and rebuilds a compact per-request sketch of it; the other steps read the sketch instead of the full state, except for dense heads.
+SketchSSM speeds up the decode of recurrent (state space and linear attention) layers. Each request decodes in windows of `W` steps (`--replayssm-buffer-len`, 16 by default). The last step of a window flushes the window into the exact recurrent state and rebuilds a compact per-request sketch of it; the other steps read the sketch instead of the full state. Dense heads (rank 0) keep BF16 rows of their full state instead, built with the sketch at the flush and after prefill; the FP32 state stays exact and changes only at flushes.
 
 The per-head sketch ranks and orthogonal frames come from an offline calibration of the model ([SketchSSM](https://github.com/SNU-ARC/SketchSSM)).
 

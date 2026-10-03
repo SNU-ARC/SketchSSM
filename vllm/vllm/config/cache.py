@@ -202,7 +202,12 @@ class CacheConfig:
     Requires mamba_cache_mode 'none' or 'align' (prefix caching) and the Triton
     or FlashInfer mamba backend; standard (non-speculative) decode only. In align
     mode flushes are most efficient when mamba_block_size is a multiple of
-    replayssm_buffer_len, but this is not required."""
+    replayssm_buffer_len, but this is not required.
+    Gated DeltaNet models run it on the SketchSSM kernels with dense heads and
+    the SketchSSM constraints, without a calibration. On GLM-5.3-Flash KDA it
+    selects the exact W=16 window decode instead, which requires Model Runner
+    V2, synchronous scheduling, no prefix caching, a float32 SSM state cache
+    and buffer length 16."""
     sketchssm: str | None = None
     """SketchSSM calibration file, directory or Hugging Face repo id. Enables
     SketchSSM decode, which reads a compact per-request sketch of the state."""
@@ -211,6 +216,9 @@ class CacheConfig:
     (default 8)."""
     use_kda_recoverssm: bool = field(default=False, init=False)
     """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
+    use_gdn_replayssm: bool = field(default=False, init=False)
+    """Whether `use_replayssm` runs Gated DeltaNet layers on the SketchSSM
+    kernels with dense heads (set from the model)."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
@@ -305,6 +313,12 @@ class CacheConfig:
     def uses_mamba_window_rings(self) -> bool:
         """Whether the Mamba cache holds ReplaySSM/SketchSSM window rings."""
         return self.use_replayssm or self.sketchssm is not None
+
+    @property
+    def uses_gdn_sketchssm(self) -> bool:
+        """Whether GDN layers decode with the SketchSSM kernels: calibrated, or
+        dense heads only for GDN ReplaySSM."""
+        return self.sketchssm is not None or self.use_gdn_replayssm
 
     _block_size_resolved: bool = field(default=False, init=False)
     """Guard against pydantic re-running _apply_block_size_default."""

@@ -504,7 +504,7 @@ def test_kda_cuda_graph_lifecycle(window):
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
         torch.testing.assert_close(state, eager_state, rtol=0, atol=0)
         for x, y in zip(hn.rings.tensors(), eager.rings.tensors()):
-            torch.testing.assert_close(x, y, rtol=0, atol=0)
+            assert same_bits(x, y)
         oracle.step(rows, *data, a.cpu(), bias.cpu())
     slots, _, pos, _ = hn.metadata(live)
     kda_sketch_fold_window_(state, hn.rings, slots, pos, hn.tables)
@@ -513,6 +513,13 @@ def test_kda_cuda_graph_lifecycle(window):
     torch.testing.assert_close(
         state[1:8].double().cpu(), oracle.state[1:8], rtol=1e-3, atol=4e-6
     )
+
+
+def same_bits(x: torch.Tensor, y: torch.Tensor) -> bool:
+    """Bitwise equality: dense heads keep FP32 replay rows in the bytes of
+    their BF16 u / d rings, which may read as BF16 NaNs."""
+    ints = {2: torch.int16, 4: torch.int32}
+    return torch.equal(x.view(ints[x.element_size()]), y.view(ints[y.element_size()]))
 
 
 def fused_views(q, k, v, gate, beta) -> Inputs:
@@ -560,11 +567,11 @@ def test_kda_strided_inputs(window):
         )
 
     def buffers(hn):
-        sketch = (hn.sketch.u, hn.sketch.phi, hn.sketch.f)
+        sketch = (hn.sketch.u, hn.sketch.phi, hn.sketch.f, hn.sketch.dense)
         return [hn.state, *hn.rings.tensors(), *sketch]
 
     for x, y in zip(buffers(dense), buffers(strided)):
-        torch.testing.assert_close(x, y, rtol=0, atol=0)
+        assert same_bits(x, y)
 
 
 @pytest.mark.parametrize(

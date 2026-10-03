@@ -62,7 +62,7 @@ was built with, so install `sketchssm` alongside it.
 ```python
 from sketchssm import kernels as sk
 
-sk.API_VERSION                     # 1; bumped on a breaking change
+sk.API_VERSION                     # 2; bumped on a breaking change
 sk.set_config_dirs([folder, ...])  # extra tuned-config folders
 sk.set_aot_dirs([folder, ...])     # extra precompiled-kernel folders
 sk.set_cache_dir(path)             # where the NVRTC builds go

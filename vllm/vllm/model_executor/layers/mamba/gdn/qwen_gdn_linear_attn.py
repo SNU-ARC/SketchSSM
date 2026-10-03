@@ -380,7 +380,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv_kernel_size,
             self.num_spec,
         )
-        if self.cache_config.sketchssm is not None:
+        if self.cache_config.uses_gdn_sketchssm:
             shapes = MambaStateShapeCalculator.append_gdn_sketchssm_ring(
                 shapes,
                 self.tp_size,
@@ -394,7 +394,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         dtypes = super().get_state_dtype()
-        if self.cache_config.sketchssm is not None:
+        if self.cache_config.uses_gdn_sketchssm:
             dtypes = MambaStateDtypeCalculator.append_gdn_sketchssm_ring(
                 dtypes, self.model_config.dtype
             )
@@ -419,7 +419,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
         self.sketchssm: GDNSketchSSM | None = None
-        if vllm_config.cache_config.sketchssm is not None:
+        if vllm_config.cache_config.uses_gdn_sketchssm:
             if gqa_interleaved_layout:
                 raise ValueError("SketchSSM requires the non-interleaved GDN layout")
             self.sketchssm = GDNSketchSSM.maybe_create(

@@ -123,7 +123,8 @@ kda_step_kernel(const int* __restrict__ Heads, int NH,
     const __nv_bfloat16* __restrict__ U, const __nv_bfloat16* __restrict__ Phi, const int* __restrict__ Ranks,
     __nv_bfloat16* __restrict__ KR, __nv_bfloat16* __restrict__ VR, float* __restrict__ BR,
     float* __restrict__ PrefixR, __nv_bfloat16* __restrict__ FR, __nv_bfloat16* __restrict__ UR, __nv_bfloat16* __restrict__ DR, long RS,
-    __nv_bfloat16* __restrict__ Out, int H, int G, float scale)
+    __nv_bfloat16* __restrict__ Out, int H, int G, float scale,
+    const __nv_bfloat16* __restrict__ Dense, long DS, const int* __restrict__ DenseRows)
 {
     __shared__ __align__(128) unsigned char sm[NW * WBYTES];
     __shared__ __align__(16) unsigned sZ[256];                    // 1 KB of zeros: B fragments of lanes g >= 4
@@ -190,8 +191,8 @@ kda_step_kernel(const int* __restrict__ Heads, int NH,
     const float4 qh = make_float4(q0.x * qf, q0.y * qf, q0.z * qf, q0.w * qf);
     const float4 kh = make_float4(k0.x * kf, k0.y * kf, k0.z * kf, k0.w * kf);
     float4 la;
-    la.x = -5.f * fsig(amp * (g0.x + b0.x)); la.y = -5.f * fsig(amp * (g0.y + b0.y));   // same arithmetic as the fp32-storage step (bitwise state parity)
-    la.z = -5.f * fsig(amp * (g0.z + b0.z)); la.w = -5.f * fsig(amp * (g0.w + b0.w));
+    la.x = __fmul_rn(-5.f, fsig(amp * (g0.x + b0.x))); la.y = __fmul_rn(-5.f, fsig(amp * (g0.y + b0.y)));   // rounded: not contracted into prefix (bitwise parity with the base step)
+    la.z = __fmul_rn(-5.f, fsig(amp * (g0.z + b0.z))); la.w = __fmul_rn(-5.f, fsig(amp * (g0.w + b0.w)));
     const float4 pre = make_float4(prev.x + la.x, prev.y + la.y, prev.z + la.z, prev.w + la.w);
     *(uint2*)(page_ring(KR, rp) + (size_t)(base + pos) * 128 + 4 * lane) = kraw;
     *(uint2*)(page_ring(VR, rp) + (size_t)(base + pos) * 128 + 4 * lane) = vraw;
@@ -199,21 +200,64 @@ kda_step_kernel(const int* __restrict__ Heads, int NH,
     if (lane == 0) page_ring(BR, rp)[base + pos] = beta;
     __nv_bfloat16* po = Out + io;
     if (m <= 0) {
-        float* sp = State + (long)page * S0 + (long)head * S1 + 4 * lane;
-        const float4 ea = make_float4(fexp(la.x), fexp(la.y), fexp(la.z), fexp(la.w)), v0 = unpack4(vraw);
-        float4 o4 = make_float4(0.f, 0.f, 0.f, 0.f);
-        for (int r = 0; r < 128; ++r) {
-            float4 s = *(const float4*)(sp + (long)r * 128);
-            s.x *= ea.x; s.y *= ea.y; s.z *= ea.z; s.w *= ea.w;
-            const int e = r & 3;
-            const float vsel = (e == 0) ? v0.x : (e == 1) ? v0.y : (e == 2) ? v0.z : v0.w;
-            const float d = beta * (__shfl_sync(FULL, vsel, r >> 2) - warp_sum(dot4(s, kh)));
-            s.x = fmaf(d, kh.x, s.x); s.y = fmaf(d, kh.y, s.y); s.z = fmaf(d, kh.z, s.z); s.w = fmaf(d, kh.w, s.w);
-            *(float4*)(sp + (long)r * 128) = s;
-            const float ov = warp_sum(dot4(s, qh));
-            if ((r >> 2) == lane) { if (e == 0) o4.x = ov; else if (e == 1) o4.y = ov; else if (e == 2) o4.z = ov; else o4.w = ov; }
+        // Dense head, non-flush step: its BF16 state rows S^ (rebuilt at each flush) and the window replay,
+        //   delta_p = beta (v - S^ (e k^) - sum_t delta_t kk_t), out = S^ (e q^) + sum_t delta_t kq_t + delta_p kq_cur,
+        //   e = exp(prefix_p), kk_t / kq_t = <k^_t exp(prefix_p - prefix_t), k^ / q^>.  The FP32 state is not read;
+        //   the flush (pos W - 1) folds the raw rows into it exactly.  FP32 delta_t rows: the head's u ring bytes
+        //   (t < W / 2), then its d ring bytes.
+        if (pos >= KDA_W - 1) return;
+        float* dl_u = (float*)(page_ring(UR, rp) + (size_t)base * 128) + 4 * lane;
+        float* dl_d = (float*)(page_ring(DR, rp) + (size_t)base * 128) + 4 * lane;
+        for (int t = 0; t < pos; ++t) {
+            const float4 kt = ld4_bf16(page_ring(KR, rp) + (size_t)(base + t) * 128 + 4 * lane);
+            const float4 pt = *(const float4*)(page_ring(PrefixR, rp) + (size_t)(base + t) * 128 + 4 * lane);
+            const float4 e = make_float4(kt.x * fexp(pre.x - pt.x), kt.y * fexp(pre.y - pt.y), kt.z * fexp(pre.z - pt.z), kt.w * fexp(pre.w - pt.w));
+            float n2 = dot4(kt, kt), a = dot4(e, kh), b = dot4(e, qh);
+            #pragma unroll
+            for (int o = 16; o >= 1; o >>= 1) {
+                n2 += __shfl_xor_sync(FULL, n2, o); a += __shfl_xor_sync(FULL, a, o); b += __shfl_xor_sync(FULL, b, o);
+            }
+            const float inv = rsqrtf(n2 + 1.e-6f);
+            if (lane == 0) { s_kk[t] = a * inv; s_kk[KDA_W + t] = b * inv; }
         }
-        st4_bf16(po, o4);
+        const float4 ep = make_float4(fexp(pre.x), fexp(pre.y), fexp(pre.z), fexp(pre.w));
+        const float4 ek = make_float4(ep.x * kh.x, ep.y * kh.y, ep.z * kh.z, ep.w * kh.w);
+        const float4 eq = make_float4(ep.x * qh.x, ep.y * qh.y, ep.z * qh.z, ep.w * qh.w);
+        const __nv_bfloat16* ps = Dense + (size_t)slot * DS + (size_t)DenseRows[head] * 16384 + 4 * lane;
+        // S^ (e k^), S^ (e q^): 8 rows per pass, partials reduce-scattered over the lanes (index j < 8: k, row j;
+        // j >= 8: q, row j - 8; lane l ends with index l & 15), then summed over lane bit 4
+        for (int r0 = 0; r0 < 128; r0 += 8) {
+            float pp[16];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float4 sv = ld4_bf16(ps + (size_t)(r0 + i) * 128);
+                pp[i] = dot4(sv, ek); pp[8 + i] = dot4(sv, eq);
+            }
+            #pragma unroll
+            for (int o = 8; o >= 1; o >>= 1) {
+                const bool up = lane & o;
+                #pragma unroll
+                for (int i = 0; i < o; ++i) {
+                    const float send = up ? pp[i] : pp[i + o], keep = up ? pp[i + o] : pp[i];
+                    pp[i] = keep + __shfl_xor_sync(FULL, send, o);
+                }
+            }
+            pp[0] += __shfl_xor_sync(FULL, pp[0], 16);
+            if (lane < 16) s_c[128 * (lane >> 3) + r0 + (lane & 7)] = pp[0];
+        }
+        const float kq_cur = warp_sum(dot4(kh, qh));
+        __syncwarp();
+        float4 rk = make_float4(0.f, 0.f, 0.f, 0.f), rq = rk;
+        for (int t = 0; t < pos; ++t) {
+            const float4 d = *(const float4*)((t < KDA_W / 2 ? dl_u : dl_d) + (t % (KDA_W / 2)) * 128);
+            const float a = s_kk[t], b = s_kk[KDA_W + t];
+            rk.x = fmaf(d.x, a, rk.x); rk.y = fmaf(d.y, a, rk.y); rk.z = fmaf(d.z, a, rk.z); rk.w = fmaf(d.w, a, rk.w);
+            rq.x = fmaf(d.x, b, rq.x); rq.y = fmaf(d.y, b, rq.y); rq.z = fmaf(d.z, b, rq.z); rq.w = fmaf(d.w, b, rq.w);
+        }
+        const float4 pk = *(const float4*)(s_c + 4 * lane), pq = *(const float4*)(s_c + 128 + 4 * lane), v0 = unpack4(vraw);
+        const float4 dn = make_float4(beta * (v0.x - pk.x - rk.x), beta * (v0.y - pk.y - rk.y), beta * (v0.z - pk.z - rk.z), beta * (v0.w - pk.w - rk.w));
+        *(float4*)((pos < KDA_W / 2 ? dl_u : dl_d) + (pos % (KDA_W / 2)) * 128) = dn;
+        st4_bf16(po, make_float4(pq.x + rq.x + dn.x * kq_cur, pq.y + rq.y + dn.y * kq_cur, pq.z + rq.z + dn.z * kq_cur, pq.w + rq.w + dn.w * kq_cur));
         return;
     }
     if (!sketch) return;

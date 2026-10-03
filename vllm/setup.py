@@ -54,6 +54,16 @@ USE_PRECOMPILED_RUST_FRONTEND = (
 )
 
 
+# Upstream vLLM commit this SketchSSM fork is based on (v0.30.0). Precompiled
+# builds use its wheel by default: the fork also ships as a subdirectory of the
+# SketchSSM repository, where the upstream history is not available.
+SKETCHSSM_UPSTREAM_COMMIT = "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+# There, setuptools-scm would find the SketchSSM repository instead of vLLM's,
+# so the version is set here.
+if not os.path.exists(os.path.join(ROOT_DIR, ".git")):
+    os.environ.setdefault("SETUPTOOLS_SCM_PRETEND_VERSION", "0.30.0")
+
+
 def should_require_rust_frontend() -> bool:
     value = os.getenv("VLLM_REQUIRE_RUST_FRONTEND", "")
     return value.lower() not in ("", "0", "false", "no")
@@ -839,7 +849,9 @@ class precompiled_wheel_utils:
         import platform
 
         arch = platform.machine()
-        commit = os.getenv("VLLM_PRECOMPILED_WHEEL_COMMIT", "").lower()
+        commit = os.getenv(
+            "VLLM_PRECOMPILED_WHEEL_COMMIT", SKETCHSSM_UPSTREAM_COMMIT
+        ).lower()
         if not commit or len(commit) != 40:
             print(
                 f"VLLM_PRECOMPILED_WHEEL_COMMIT not valid: {commit}"
@@ -928,7 +940,9 @@ class precompiled_wheel_utils:
             variant = os.getenv("VLLM_PRECOMPILED_WHEEL_VARIANT", None)
             if variant is None:
                 variant = precompiled_wheel_utils.detect_system_cuda_variant()
-            commit = os.getenv("VLLM_PRECOMPILED_WHEEL_COMMIT", "").lower()
+            commit = os.getenv(
+                "VLLM_PRECOMPILED_WHEEL_COMMIT", SKETCHSSM_UPSTREAM_COMMIT
+            ).lower()
             if not commit or len(commit) != 40:
                 print(
                     f"VLLM_PRECOMPILED_WHEEL_COMMIT not valid: {commit}"

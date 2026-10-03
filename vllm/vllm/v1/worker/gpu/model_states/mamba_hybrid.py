@@ -295,7 +295,10 @@ class MambaHybridModelState(DefaultModelState):
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
         replayssm_decode_base_cpu = None
-        if self.cache_config.sketchssm is not None:
+        if (
+            self.cache_config.sketchssm is not None
+            or self.cache_config.use_gdn_replayssm
+        ):
             # Padding rows get a zero origin. prefill_len includes output
             # tokens replayed on resumption.
             replayssm_decode_base_cpu = torch.zeros(num_reqs, dtype=torch.int32)

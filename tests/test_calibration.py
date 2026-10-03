@@ -124,9 +124,13 @@ class CalibrationTests(unittest.TestCase):
         cost = Traffic(128, 80)
         self.assertEqual(AllocationCost(128, 80).crossover, 49)
         self.assertEqual(cost.sketch_nonflush * 4, 2 * (128 + 80))
-        report = cost.report(cost.dense_nonflush)
+        report = cost.report(cost.state)              # non-flush reads of the FP32 state
         self.assertEqual(report['read_reduction'], 1)
         self.assertAlmostEqual(report['access_reduction'], 2 / (1 + 1 / 16))
+        self.assertEqual(cost.dense_nonflush * 4, 2 * 128 * 80)   # dense heads: BF16 rows
+        # Dense and sketch reads are both BF16, in the ratio of the allocation costs.
+        self.assertAlmostEqual(cost.dense_nonflush / cost.sketch_nonflush,
+                               AllocationCost(128, 80).dense / AllocationCost(128, 80).rank)
         self.assertEqual(Traffic(128, 128, erase=True).sketch_nonflush * 4, 2 * (128 + 128 + 16))
 
     def test_reuse_preserves_tables_and_reports_actual_precision(self):
@@ -140,7 +144,9 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(out['meta']['allocation_policy'], 'reuse_unchanged')
         self.assertEqual(out['meta']['traffic']['state_dtype'], 'float32')
         self.assertEqual(out['meta']['traffic']['sketch_dtype'], 'bfloat16')
-        self.assertAlmostEqual(out['meta']['traffic']['state_read'], 4 + 15 / 16 * 40)
+        # flush: 4*K*V/W = 4; non-flush: mean of the dense head's BF16 rows (K*V/2 = 8)
+        # and the rank-1 sketch ((K+V)/2 = 4) words, 4 bytes each
+        self.assertAlmostEqual(out['meta']['traffic']['state_read'], 4 + 15 / 16 * 24)
 
     def test_all_dense_group_exports_identity(self):
         basis = self.make_basis()

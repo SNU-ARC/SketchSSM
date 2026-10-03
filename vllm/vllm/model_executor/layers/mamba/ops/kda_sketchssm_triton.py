@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SketchSSM Kimi Delta Attention (KDA) decode kernels (Triton).
 
-The step reads each sketch head's sketch; the flush folds the window into the
-state with the WY form, then rebuilds the sketch in a stats and a finish
-launch.
+The step reads each sketch head's sketch, and each dense head's BF16 state
+rows; the flush folds the window into the state (sketch heads: the WY form;
+dense heads: the recurrence), then rebuilds the sketch in a stats and a finish
+launch and the dense heads' BF16 state rows.
 """
 
 import functools
@@ -46,8 +47,8 @@ def _num_sms(device: torch.device) -> int:
 def _kda_sketch_step_kernel(
     q, k, v, gate, beta, s_q, s_k, s_v, s_g, s_b, A_log, bias, slots, meta,
     pos_ptr, state, s_st0, s_st1, u, phi, f, ranks, kr, vr, br, pr, ur, dr,
-    s_kr, s_vr, s_br, s_pr, s_ur, s_dr, out, scale, G, H, D: tl.constexpr,
-    W: tl.constexpr,
+    s_kr, s_vr, s_br, s_pr, s_ur, s_dr, out, scale, G, H, dense, s_dn,
+    dense_rows, D: tl.constexpr, W: tl.constexpr,
     BV: tl.constexpr, BG: tl.constexpr,
 ):  # fmt: skip
     LOG2E: tl.constexpr = 1.4426950408889634
@@ -87,19 +88,13 @@ def _kda_sketch_step_kernel(
         tl.store(p_pre + p * D + kk, pre)
         tl.store(br + page * s_br + ring + p, bet)
         if m <= 0:
-            # Dense head: S = S diag(exp(la)); S += beta (v - S k) k^T; o = S q.
-            ea = tl.exp2(la * LOG2E)
-            p_s = state + page * s_st0 + head * s_st1
-            for v0 in tl.static_range(0, D, BV):
-                vb = v0 + tl.arange(0, BV)
-                ptr = p_s + vb[:, None] * D + kk[None, :]
-                s = tl.load(ptr) * ea[None, :]
-                vv = tl.load(v + r64 * s_v + hd + vb).to(tl.float32)
-                d = bet * (vv - tl.sum(s * kh[None, :], axis=1))
-                s += d[:, None] * kh[None, :]
-                tl.store(ptr, s)
-                o = tl.sum(s * qh[None, :], axis=1)
-                tl.store(out + io + vb, o.to(out.dtype.element_ty))
+            if p < W - 1:
+                _kda_dense_replay(
+                    page, slot, head, p, pre, kh, qh, bet, v, r64 * s_v + hd,
+                    kr + page * s_kr + ring * D, p_pre, ur, dr, page * s_ur,
+                    page * s_dr, ring, dense, s_dn, dense_rows, out, io, D, W,
+                    BV,
+                )  # fmt: skip
         elif p < W - 1:
             # Sketch head.
             t2 = pre * LOG2E
@@ -191,6 +186,53 @@ def _kda_sketch_step_kernel(
             o = orep + (kq_cur * bet) * vf + acc
             tl.store(p_u + p * D + kk, unew.to(ur.dtype.element_ty))
             tl.store(out + io + kk, o.to(out.dtype.element_ty))
+
+
+@triton.jit
+def _kda_dense_replay(page, slot, head, p, pre, kh, qh, bet, v, v_off, p_k,
+                      p_pre, ur, dr, ur_off, dr_off, ring, dense, s_dn,
+                      dense_rows, out, io, D: tl.constexpr, W: tl.constexpr,
+                      BV: tl.constexpr):  # fmt: skip
+    # Dense head, non-flush step, from its BF16 state rows S^ and the window:
+    # delta_p = beta (v - S^ (e k^) - sum_t delta_t kk_t),
+    # out = S^ (e q^) + sum_t delta_t kq_t + delta_p kq_cur, e = exp(prefix_p),
+    # kk_t / kq_t = <k^_t exp(prefix_p - prefix_t), k^ / q^>. FP32 delta_t
+    # rows: u_ring bytes (t < W / 2), then d_ring bytes.
+    LOG2E: tl.constexpr = 1.4426950408889634
+    HALF: tl.constexpr = W // 2
+    kk = tl.arange(0, D)
+    ww = tl.arange(0, W)
+    tmask = ww < p
+    keys = tl.load(
+        p_k + ww[:, None] * D + kk[None, :], mask=tmask[:, None], other=0.0
+    ).to(tl.float32)
+    keys *= tl.math.rsqrt(tl.sum(keys * keys, axis=1) + 1e-6)[:, None]
+    pf = tl.load(p_pre + ww[:, None] * D + kk[None, :], mask=tmask[:, None], other=0.0)
+    ell = tl.where(tmask[:, None], keys * tl.exp2((pre[None, :] - pf) * LOG2E), 0.0)
+    kkv = tl.sum(ell * kh[None, :], axis=1)
+    kqv = tl.sum(ell * qh[None, :], axis=1)
+    kq_cur = tl.sum(kh * qh)
+    ep = tl.exp2(pre * LOG2E)
+    ek = ep * kh
+    eq = ep * qh
+    urf = (ur + ur_off + ring * D).to(tl.pointer_type(tl.float32))
+    drf = (dr + dr_off + ring * D).to(tl.pointer_type(tl.float32))
+    d_row = tl.where(ww < HALF, urf + ww * D, drf + (ww - HALF) * D)
+    p_cur = tl.where(p < HALF, urf + p * D, drf + (p - HALF) * D)
+    p_s = dense + slot * s_dn + tl.load(dense_rows + head).to(tl.int64) * D * D
+    for v0 in tl.static_range(0, D, BV):
+        vb = v0 + tl.arange(0, BV)
+        s = tl.load(p_s + vb[:, None] * D + kk[None, :]).to(tl.float32)
+        pk = tl.sum(s * ek[None, :], axis=1)
+        pq = tl.sum(s * eq[None, :], axis=1)
+        dl = tl.load(d_row[:, None] + vb[None, :], mask=tmask[:, None], other=0.0)
+        rk = tl.sum(dl * kkv[:, None], axis=0)
+        rq = tl.sum(dl * kqv[:, None], axis=0)
+        vv = tl.load(v + v_off + vb).to(tl.float32)
+        delta = bet * (vv - pk - rk)
+        tl.store(p_cur + vb, delta)
+        o = pq + rq + delta * kq_cur
+        tl.store(out + io + vb, o.to(out.dtype.element_ty))
 
 
 @triton.jit
@@ -654,6 +696,57 @@ def _kda_sketch_finish_kernel(
         row = tl.load(rows + idx // NHall, mask=idx < total, other=-1)
 
 
+@triton.jit
+def _kda_dense_flush_kernel(
+    rows, slots, meta, heads, state, s_st0, s_st1, dense, s_dn, kr, vr, pr, br,
+    s_kr, s_vr, s_pr, s_br, q, s_q, out, scale, H, D: tl.constexpr,
+    W: tl.constexpr, BV: tl.constexpr, FOLD: tl.constexpr,
+):  # fmt: skip
+    # Dense heads: FOLD applies the window's raw rows to the FP32 state (the
+    # exact recurrence) and writes the output; then the BF16 state rows.
+    item = tl.program_id(0)
+    j = tl.program_id(1)
+    block = tl.program_id(2)
+    row = tl.load(rows + item)
+    if row >= 0:
+        page = tl.load(slots + row).to(tl.int64)
+        if page > 0:
+            h = tl.load(heads + j)
+            slot = tl.load(meta + row).to(tl.int64)
+            kk = tl.arange(0, D)
+            vb = block * BV + tl.arange(0, BV)
+            sp = state + page * s_st0 + h * s_st1 + vb[:, None] * D + kk[None, :]
+            s = tl.load(sp)
+            if FOLD:
+                ring = h * W
+                p_k = kr + page * s_kr + ring * D
+                p_v = vr + page * s_vr + ring * D
+                p_pre = pr + page * s_pr + ring * D
+                p_b = br + page * s_br + ring
+                prev = tl.zeros([D], tl.float32)
+                for t in range(W):
+                    k = tl.load(p_k + t * D + kk).to(tl.float32)
+                    k *= tl.math.rsqrt(tl.sum(k * k) + 1e-6)
+                    prefix = tl.load(p_pre + t * D + kk)
+                    s *= tl.exp(prefix - prev)[None, :]
+                    prev = prefix
+                    v = tl.load(p_v + t * D + vb).to(tl.float32)
+                    delta = tl.load(p_b + t) * (v - tl.sum(s * k[None, :], axis=1))
+                    s += delta[:, None] * k[None, :]
+                tl.store(sp, s)
+                q0 = tl.load(q + row.to(tl.int64) * s_q + h * D + kk).to(tl.float32)
+                qh = q0 * (tl.math.rsqrt(tl.sum(q0 * q0) + 1e-6) * scale)
+                o = tl.sum(s * qh[None, :], axis=1)
+                tl.store(
+                    out + (row * H + h).to(tl.int64) * D + vb,
+                    o.to(out.dtype.element_ty),
+                )
+            tl.store(
+                dense + slot * s_dn + j * D * D + vb[:, None] * D + kk[None, :],
+                s.to(dense.dtype.element_ty),
+            )
+
+
 def _check_scratch(scratch: torch.Tensor, rows: int, sketch: KDASketchArgs) -> None:
     need = rows * sketch.tables.num_sketch_heads * KDA_SKETCH_SCRATCH_F
     assert scratch.dtype == torch.float32 and scratch.numel() >= need
@@ -672,7 +765,7 @@ def _check_storage(state: torch.Tensor, rings: KDASketchRings, sketch):
     assert state.stride(2) == d and state.stride(3) == 1
     for ring in rings.tensors():
         assert ring.shape[2] == w and ring[0].is_contiguous()
-    for x in (sketch.u, sketch.phi, sketch.f):
+    for x in (sketch.u, sketch.phi, sketch.f, sketch.dense):
         assert x.is_contiguous() and x.dtype == torch.bfloat16
     assert sketch.f.shape[-1] == w
 
@@ -691,13 +784,22 @@ def _flush_launches(
     flush: bool,
 ) -> None:
     t = sketch.tables
-    if not t.num_sketch_heads:
-        return
     assert rows.is_contiguous() and rows.dtype == torch.int32
-    _check_scratch(scratch, rows.numel(), sketch)
     _check_storage(state, rings, sketch)
     r = rings
     n = rows.numel()
+    if t.num_dense_heads and n:
+        _kda_dense_flush_kernel[(n, t.num_dense_heads, KDA_SKETCH_HEAD_DIM // 32)](
+            rows, slots, meta, t.dense_heads_d, state, state.stride(0),
+            state.stride(1), sketch.dense, sketch.dense.stride(0), r.k, r.v,
+            r.prefix, r.beta, r.k.stride(0), r.v.stride(0), r.prefix.stride(0),
+            r.beta.stride(0), q, q.stride(0) if flush else 0, out, scale,
+            t.num_heads, D=KDA_SKETCH_HEAD_DIM, W=t.window, BV=32, FOLD=flush,
+            num_warps=4,
+        )  # fmt: skip
+    if not t.num_sketch_heads:
+        return
+    _check_scratch(scratch, rows.numel(), sketch)
     sms = _num_sms(state.device)
     rocm = current_platform.is_rocm()
     prec = None if rocm else "tf32x3"
@@ -806,8 +908,9 @@ def kda_sketch_triton_decode(
         state.stride(1), sketch.u, sketch.phi, sketch.f, t.ranks, r.k, r.v,
         r.beta, r.prefix, r.u_ring, r.d_ring, r.k.stride(0), r.v.stride(0),
         r.beta.stride(0), r.prefix.stride(0), r.u_ring.stride(0),
-        r.d_ring.stride(0), out, scale, t.rank_cap, h, D=KDA_SKETCH_HEAD_DIM,
-        W=t.window, BV=16, BG=STEP_BG, num_warps=STEP_WARPS,
+        r.d_ring.stride(0), out, scale, t.rank_cap, h, sketch.dense,
+        sketch.dense.stride(0), t.dense_rows, D=KDA_SKETCH_HEAD_DIM, W=t.window,
+        BV=16, BG=STEP_BG, num_warps=STEP_WARPS,
     )  # fmt: skip
     if has_flush_rows:
         _flush_launches(

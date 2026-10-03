@@ -5,7 +5,11 @@
 The state ``(slot, HV, V, K)`` is kept in rotated key coordinates. Per
 request, a value head of rank ``m`` (0 = dense) keeps packed BF16 rows ``u``
 (leading key columns), ``phi`` (coefficient map) and ``fs`` (projected erase
-history). Sketch buffers are indexed by the persistent request index.
+history). Dense heads keep all ``K`` key columns in ``u``: non-flush steps
+read them instead of the FP32 state, which changes only at flushes. Their
+layout ``u_off`` is -1 when they have no rows (ReplaySSM: every head dense,
+the FP32 state read at every step). Sketch buffers are indexed by the
+persistent request index.
 """
 
 from dataclasses import dataclass
@@ -28,9 +32,13 @@ def gdn_sketch_window_supported(window: int) -> bool:
 
 
 def gdn_sketch_layout(
-    ranks: torch.Tensor, window: int = GDN_SKETCH_WINDOW
+    ranks: torch.Tensor, window: int = GDN_SKETCH_WINDOW, dense_rows: bool = True
 ) -> tuple[torch.Tensor, tuple[int, ...]]:
-    """Per-head ``(u_off, phi_off, fs_off, FG)`` table and packed row lengths."""
+    """Per-head ``(u_off, phi_off, fs_off, FG)`` table and packed row lengths.
+
+    With ``dense_rows``, dense heads keep their ``K`` BF16 key columns in
+    ``u``; otherwise their ``u_off`` is -1.
+    """
     if not gdn_sketch_window_supported(window):
         raise ValueError(
             f"GDN SketchSSM window {window} is not a multiple of "
@@ -43,8 +51,8 @@ def gdn_sketch_layout(
         if not 0 <= m <= k:
             raise ValueError(f"GDN sketch rank {m} outside [0, {k}]")
         fg = max(4, (m + 3) // 4 * 4)
-        rows.append((nu, nm, nf, fg))
-        nu += m * k
+        rows.append((nu if m or dense_rows else -1, nm, nf, fg))
+        nu += m * k if m else k * k if dense_rows else 0
         nm += 0 if m in (0, k) else m * k if m <= p else p * k + (p + 1) * fg
         nf += window * fg if m else 0
     # Rows are staged with 16-byte copies.
@@ -58,14 +66,19 @@ def gdn_rank_cap(ranks: torch.Tensor) -> int:
 
 
 class GDNSketchTables(torch.nn.Module):
-    """Ranks and packed-layout table of one GDN layer."""
+    """Ranks and packed-layout table of one GDN layer (``dense_rows``: see
+    ``gdn_sketch_layout``)."""
 
     def __init__(
-        self, ranks: torch.Tensor, num_k_heads: int, window: int = GDN_SKETCH_WINDOW
+        self,
+        ranks: torch.Tensor,
+        num_k_heads: int,
+        window: int = GDN_SKETCH_WINDOW,
+        dense_rows: bool = True,
     ):
         super().__init__()
         ranks = ranks.to(torch.int32).cpu()
-        layout, self.sizes = gdn_sketch_layout(ranks, window)
+        layout, self.sizes = gdn_sketch_layout(ranks, window, dense_rows)
         self.num_k_heads = num_k_heads
         self.window = window
         self.num_v_heads = ranks.numel()
@@ -164,8 +177,15 @@ def _build_head(base, sk, h, u, packed, fs, beta, widths, layout, SU: tl.constex
     for wr in tl.static_range(0, W, 16):
         tl.store(beta + (sk * HV + h) * W + wr + w, tl.zeros([16], tl.float32))
     m = tl.load(widths + h)
+    uoff = tl.load(layout + h * 4)
+    if (m == 0) & (uoff >= 0):
+        # Dense head: all K key columns, read on the non-flush steps.
+        s = tl.load(base + v[:, None] * SV + j[None, :] * SK)
+        tl.store(
+            u + sk * SU + uoff + j[None, :] * V + v[:, None],
+            s.to(u.dtype.element_ty),
+        )
     if m > 0:
-        uoff = tl.load(layout + h * 4)
         moff = tl.load(layout + h * 4 + 1)
         foff = tl.load(layout + h * 4 + 2)
         fg = tl.load(layout + h * 4 + 3)

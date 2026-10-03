@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SketchSSM project
-"""BF16 sketch/map reads and FP32 dense fallback; all K coordinates, no anchors."""
+"""State traffic: the FP32 state is read and written at the flush; non-flush
+steps read BF16 sketch/map rows, and dense heads BF16 rows of their full state."""
 from dataclasses import dataclass
 
 
@@ -23,12 +24,18 @@ class Traffic:
         return 0.5 * (self.K + self.V + (self.W if self.erase else 0))
 
     @property
-    def dense_nonflush(self):
+    def state(self):
+        """The FP32 state of a head, read every step by Standard decode."""
         return self.K * self.V
 
     @property
+    def dense_nonflush(self):
+        """A dense head's BF16 copy of its state, built at the flush."""
+        return 0.5 * self.K * self.V
+
+    @property
     def flush(self):
-        return self.dense_nonflush / self.W
+        return self.state / self.W
 
     def report(self, mean_nonflush):
         read = 4 * (self.flush + (self.W - 1) / self.W * mean_nonflush)
@@ -37,17 +44,18 @@ class Traffic:
                     erase=self.erase, state_dtype='float32', sketch_dtype='bfloat16',
                     coefficient_map_dtype='bfloat16', state_read=read, state_write=write,
                     state_access=read + write,
-                    read_reduction=4 * self.dense_nonflush / read,
-                    access_reduction=8 * self.dense_nonflush / (read + write))
+                    read_reduction=4 * self.state / read,
+                    access_reduction=8 * self.state / (read + write))
 
 
 @dataclass(frozen=True)
 class AllocationCost:
-    """Fixed allocation weights, independent of BF16 inference storage.
+    """Allocation weights of a sketch rank and of the dense fallback.
 
-    A rank costs K+V+eW and dense fallback costs KV, preserving the
-    established allocation rule. These are optimization units, not measured
-    BF16 bytes. Report inference traffic separately with Traffic.
+    A rank costs K+V+eW and dense fallback costs KV: the non-flush BF16 reads
+    of a rank's sketch/map rows and of a dense head's state rows are in this
+    ratio, so the dense crossover rank is where both cost the same traffic.
+    Report the traffic itself with Traffic.
     """
     K: int
     V: int

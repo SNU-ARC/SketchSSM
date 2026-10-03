@@ -224,10 +224,16 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
 
 
-def test_sketchssm_window_pos_and_prompt_tail():
-    """SketchSSM window positions; a one-token prompt tail is a prefill."""
+@pytest.mark.parametrize("gdn_replayssm", [False, True])
+def test_sketchssm_window_pos_and_prompt_tail(gdn_replayssm: bool):
+    """SketchSSM (and GDN ReplaySSM) window positions; a one-token prompt tail
+    is a prefill."""
     builder = _create_gdn_builder(full_cuda_graph=True)
-    builder.vllm_config.cache_config.sketchssm = "unused.pt"
+    cache_config = builder.vllm_config.cache_config
+    if gdn_replayssm:
+        cache_config.use_replayssm = cache_config.use_gdn_replayssm = True
+    else:
+        cache_config.sketchssm = "unused.pt"
     builder = GDNAttentionMetadataBuilder(
         kv_cache_spec=builder.kv_cache_spec,
         layer_names=["layer.0"],

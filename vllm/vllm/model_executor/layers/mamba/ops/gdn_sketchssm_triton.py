@@ -87,7 +87,18 @@ def _gdn_sketch_step_kernel(
 
         hq = tl.zeros([V], tl.float32)
         hk = tl.zeros([V], tl.float32)
-        if m == 0:
+        u_off = tl.load(layout + hv * 4)
+        if (m == 0) & (u_off >= 0):
+            # Dense head: its BF16 rows of the window-start state.
+            p_u = u + cidx * s_u + u_off
+            for k0 in range(0, K, BK):
+                kc = k0 + tl.arange(0, BK)
+                s = tl.load(p_u + kc[:, None] * V + vv[None, :]).to(tl.float32)
+                qc = tl.load(p_q + kc).to(tl.float32) * q_sc
+                kcv = tl.load(p_k + kc).to(tl.float32) * k_rn
+                hq += tl.sum(s * qc[:, None], axis=0)
+                hk += tl.sum(s * kcv[:, None], axis=0)
+        elif m == 0:
             p_s = state + slot * s_st_slot + hv * s_st_head + vv[:, None] * s_st_v
             for k0 in range(0, K, BK):
                 kc = k0 + tl.arange(0, BK)
@@ -97,7 +108,6 @@ def _gdn_sketch_step_kernel(
                 hq += tl.sum(s * qc[None, :], axis=1)
                 hk += tl.sum(s * kcv[None, :], axis=1)
         else:
-            u_off = tl.load(layout + hv * 4)
             phi_off = tl.load(layout + hv * 4 + 1)
             fs_off = tl.load(layout + hv * 4 + 2)
             fg = tl.load(layout + hv * 4 + 3)
@@ -165,7 +175,7 @@ def _gdn_sketch_step_kernel(
 @triton.jit
 def _gdn_sketch_flush_kernel(
     qkv, out, state, d_cache, k_cache, g_cache, slots, meta, flush_rows, batch,
-    beta_ring, current_d, current_k, ranks, scale, s_qkv, s_st_slot,
+    beta_ring, current_d, current_k, ranks, layout, scale, s_qkv, s_st_slot,
     s_st_head, s_st_v, s_d_slot, s_d_head, s_d_pos, s_k_slot, s_k_head,
     s_k_pos, s_g_slot, s_g_head, s_beta, s_cd, s_ck, H: tl.constexpr,
     HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, W: tl.constexpr,
@@ -174,7 +184,10 @@ def _gdn_sketch_flush_kernel(
 ):  # fmt: skip
     # Flush of one value head of the rows in flush_rows (-1 padded). The
     # stored updates lack the window-start state's erase, which the WY form
-    # restores: S' = tot S + X K with X = D rep - (S K^T) T.
+    # restores: S' = tot S + X K with X = D rep - (S K^T) T. Dense heads
+    # with BF16 rows stored full updates computed from those rows (S~ = S
+    # rounded to BF16 by the build), so only the rounding residual is
+    # erased: X = D rep - ((S - S~) K^T) T.
     # Window rows are padded to WP with zero keys, updates and gates.
     hv = tl.program_id(1)
     i_h = hv // (HV // H)
@@ -188,6 +201,8 @@ def _gdn_sketch_flush_kernel(
         if slot > 0:
             cidx = tl.load(meta + row).to(tl.int64)
             m = tl.load(ranks + hv)
+            u_off = tl.load(layout + hv * 4)
+            rows = (m == 0) & (u_off >= 0)
             last = ww == W - 1
             ring = inw & ~last
             keys = tl.load(
@@ -209,7 +224,7 @@ def _gdn_sketch_flush_kernel(
             q = tl.load(qkv + row * s_qkv + i_h * K + kk).to(tl.float32)
             qn = q * (1.0 / tl.sqrt(tl.sum(q * q) + 1e-6) * scale)
             tm = tl.zeros([WP, WP], tl.float32)
-            if m > 0:
+            if (m > 0) | rows:
                 bs = tl.load(
                     beta_ring + cidx * s_beta + hv * W + ww, mask=inw, other=0.0
                 )
@@ -247,8 +262,11 @@ def _gdn_sketch_flush_kernel(
                 ).to(tl.float32)
                 d_cur = tl.load(current_d + cidx * s_cd + hv * V + vb)
                 x = tl.where(last[None, :], d_cur[:, None], d) * rep[None, :]
-                if m > 0:
-                    proj = tl.dot(s, tl.trans(keys), input_precision=PROJ_PRECISION)
+                if (m > 0) | rows:
+                    # The rows are S rounded to BF16: S - S~ is exact.
+                    res = s - s.to(tl.bfloat16).to(tl.float32)
+                    res = tl.where(rows, res, s)
+                    proj = tl.dot(res, tl.trans(keys), input_precision=PROJ_PRECISION)
                     x -= tl.dot(proj, tm, input_precision=DOT_PRECISION)
                 s = s * tot + tl.dot(x, keys, input_precision=DOT_PRECISION)
                 tl.store(ptr, s)
@@ -320,7 +338,7 @@ def gdn_sketch_triton_decode(
     fma = wp > 32
     _gdn_sketch_flush_kernel[(programs, hv)](
         mixed_qkv, out, state, d_cache, k_cache, g_cache, slots, meta, flush_rows,
-        batch, s.beta, s.current_d, s.current_k, t.ranks, scale,
+        batch, s.beta, s.current_d, s.current_k, t.ranks, t.layout, scale,
         mixed_qkv.stride(0), *strides[:-1], s.beta.stride(0), s.current_d.stride(0),
         s.current_k.stride(0), H=h, HV=hv, K=k, V=v, W=w, WP=wp, BV=16 if fma else 32,
         PROJ_PRECISION=None if rocm else "ieee" if fma else "tf32",

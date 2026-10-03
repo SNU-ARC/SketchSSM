@@ -121,11 +121,13 @@ def _build_layer(
     layer.dt_bias = dt_bias
     layer.conv1d = types.SimpleNamespace(weight=conv_weight, bias=conv_bias)
     layer.kv_cache = (conv_state, ssm_state)
+    layer.sketchssm = None
     with set_current_vllm_config(vllm_config):
         layer.chunk_gated_delta_rule = ChunkGatedDeltaRule()
     for name in (
         "rearrange_mixed_qkv",
         "_forward_core",
+        "_rotate_qk",
     ):
         setattr(
             layer,

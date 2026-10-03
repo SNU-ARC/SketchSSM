@@ -217,7 +217,7 @@ gdn_step_kernel(
     const int sidx = ssm_state_indices[i_n];
     const int wp = write_pos[i_n];
     const int mh = sk_mh[i_hv];
-    const int4 lay = layout[i_hv];                        // (u_off, phi_off, fs_off, FG)
+    const int4 lay = layout[i_hv];                        // (u_off, phi_off, fs_off, FG); dense heads: u_off -1 = no rows
     float qc[CK], kc[CK];
     {
         const TIO* pq = mixed_qkv + (long)i_n * s_mix + (i_h * K + lane * CK);
@@ -268,7 +268,7 @@ gdn_step_kernel(
     const int np = (mh < 4) ? mh : 4;
     const int urows = (mh < NF_UROWS) ? mh : NF_UROWS;
     // shared staging (cp.async), straight-line: d-ring rows < wp; first sketch rows; the coefficient block; erase history.
-    // Dense warps (mh == 0) stage nothing but the ring. Coefficient/erase blocks use 8-byte chunks (phi blocks are 8-byte aligned).
+    // Dense warps (mh == 0) stage nothing but the ring; their rows (if any) stream from global. Coefficient/erase blocks use 8-byte chunks (phi blocks are 8-byte aligned).
     static_assert(RS * V * 2 / 16 <= 32 * 8 && NF_UROWS * V * (int)sizeof(sketch_t) / 16 <= 32 * 4 && SM::FS_B / 8 <= 32 * 4 && SM::PV_B / 8 <= 32 * 7, "chunk counts");
     static_assert(SM::RING_B % 16 == 0 && SM::U_B % 16 == 0 && SM::PV_OFF % 16 == 0 && SM::FS_OFF % 16 == 0, "alignment");
 #if !(NF_ABLATE & 32)
@@ -512,9 +512,26 @@ gdn_step_kernel(
         }
         hq = make_float4(hq01.x, hq01.y, hq23.x, hq23.y);
     }
-    if (!latch) {
-        // ---- dense head: hq = S^T q, hk = S^T k streamed from global (rows of 128 keys; lane owns keys 4l..4l+3),
-        //      warp transpose-reductions over 16-row groups, results gathered to the lane's four values ----
+    if (!latch && lay.x >= 0) {
+        // ---- dense head with BF16 rows U[k][v] of the window-start state (SketchSSM): hq = U^T q, hk = U^T k,
+        //      key rows streamed from global (lane owns values 4l..4l+3), (q, k) pairs from the parked shared copy ----
+        const float2* qk_sm = (const float2*)(wsm + SM::PV_OFF);
+        const sketch_t* ub = bu + lane * VL;
+        float2 q01 = make_float2(0.f, 0.f), q23 = q01, k01 = q01, k23 = q01;
+        #pragma unroll 8
+        for (int g = 0; g < K; ++g) {
+            const float4 u = ld_sk4(ub + g * V);
+            const float2 p = qk_sm[g];
+            const float2 xq = make_float2(p.x, p.x), xk = make_float2(p.y, p.y);
+            q01 = ffma2(make_float2(u.x, u.y), xq, q01); q23 = ffma2(make_float2(u.z, u.w), xq, q23);
+            k01 = ffma2(make_float2(u.x, u.y), xk, k01); k23 = ffma2(make_float2(u.z, u.w), xk, k23);
+        }
+        hq = make_float4(q01.x, q01.y, q23.x, q23.y);
+        hk = make_float4(k01.x, k01.y, k23.x, k23.y);
+    } else if (!latch) {
+        // ---- dense head without rows (ReplaySSM): hq = S^T q, hk = S^T k streamed from global (rows of 128 keys;
+        //      lane owns keys 4l..4l+3), warp transpose-reductions over 16-row groups, results gathered to the lane's
+        //      four values ----
         float oq[4] = {0.f, 0.f, 0.f, 0.f}, ok_[4] = {0.f, 0.f, 0.f, 0.f};
         #pragma unroll 1
         for (int gi = 0; gi < V / 16; ++gi) {

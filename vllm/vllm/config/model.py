@@ -1923,6 +1923,10 @@ class ModelConfig:
         return self._model_info.supports_replayssm
 
     @property
+    def supports_gdn_replayssm(self) -> bool:
+        return self._model_info.supports_gdn_replayssm
+
+    @property
     def supports_sketchssm(self) -> bool:
         return self._model_info.supports_sketchssm
 

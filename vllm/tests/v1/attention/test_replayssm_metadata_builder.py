@@ -19,6 +19,7 @@ from tests.v1.attention.utils import (
 )
 from vllm.config.mamba import MambaBackendEnum
 from vllm.v1.attention.backends.mamba_attn import sketch_prefill_build_rows
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -316,3 +317,27 @@ def test_sketchssm_metadata():
     assert meta.sketch_meta_p.tolist() == [3, 5]
     assert meta.sketch_build_p.tolist() == [1, 0]
     assert sketch_prefill_build_rows(common, 1, 3).tolist() == [0, -1]
+
+
+def test_replayssm_skips_ringless_layers():
+    """ReplaySSM rings live in Mamba-2 pages only: a short-conv page (as in
+    Qwen4Exp next to its GDN ReplaySSM layers) builds plain metadata."""
+    vllm_config = create_vllm_config(
+        model_name="Qwen/Qwen3.5-0.8B", block_size=BLOCK_SIZE
+    )
+    vllm_config.cache_config.use_replayssm = True
+    vllm_config.cache_config.mamba_cache_mode = "none"
+    spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((3, 64),),
+        dtypes=(torch.bfloat16,),
+        mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
+    )
+    builder = MockMambaBuilder(spec, ["layer0"], vllm_config, DEVICE)
+    assert not builder.use_replayssm and not builder.use_window_rings
+    case = ReplaySSMBuildCase(
+        buffer_len=16, seq_lens=[116], query_lens=[1], is_prefilling=[False],
+        decode_base=[100], expected_write_pos=[], expected_is_flush=[],
+    )  # fmt: skip
+    meta = _build(builder, case)
+    assert meta.num_decodes == 1 and meta.write_pos_d is None

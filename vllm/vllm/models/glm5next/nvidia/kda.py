@@ -15,6 +15,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.kda_replayssm import KDAReplaySSM
 from vllm.model_executor.layers.mamba.kda_sketchssm import KDASketchSSM
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
@@ -350,6 +351,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             vllm_config.model_config.dtype,
             self.kda_lower_bound,
         )
+        self.kda_replayssm = KDAReplaySSM.maybe_create(
+            vllm_config,
+            self.local_num_heads,
+            self.head_dim,
+            self.kda_lower_bound,
+            self.kda_prefill_backend,
+        )
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
         ) = None
@@ -643,6 +651,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         def _rearr(x):
             return x.reshape(1, -1, self.local_num_heads, self.head_dim)
+
+        if self.kda_replayssm is not None:
+            assert not use_spec
+            self.kda_replayssm.forward(
+                recurrent_state, attn_metadata_narrowed,
+                _rearr(q_ns), _rearr(k_ns), _rearr(v_ns), g1_ns, beta_ns,
+                self.A_log, self.dt_bias, core_attn_out, self._flashkda_prefill,
+            )  # fmt: skip
+            return
 
         # --- core attention: spec (draft-verify) path ---
         core_attn_out_spec = None

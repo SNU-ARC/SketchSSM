@@ -146,7 +146,7 @@ class MambaStateDtypeCalculator:
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
-        if vllm_config.cache_config.sketchssm is not None:
+        if vllm_config.cache_config.uses_gdn_sketchssm:
             dtypes = cls.append_gdn_sketchssm_ring(
                 dtypes, vllm_config.model_config.dtype
             )
@@ -367,7 +367,7 @@ class MambaStateShapeCalculator:
             *args, hf_config.linear_conv_kernel_dim, _num_spec(vllm_config)
         )
         cache_config = vllm_config.cache_config
-        if cache_config.sketchssm is not None:
+        if cache_config.uses_gdn_sketchssm:
             shapes = cls.append_gdn_sketchssm_ring(
                 shapes, *args, cache_config.replayssm_buffer_len
             )

@@ -21,6 +21,66 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+@pytest.mark.parametrize("materialize", [False, True])
+def test_kda_replayssm_release_precedes_request_removal(materialize):
+    """Freed pages discard windows; a streaming continuation folds them first."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    events = []
+    ids = torch.tensor([[7, 11]], dtype=torch.int32)
+    state = torch.empty(0)
+
+    def released(actual):
+        assert actual.tolist() == [7, 11]
+        assert "model_remove" not in events
+        events.append("discard")
+
+    def folded(actual_state, actual_ids, initial):
+        assert actual_state is state
+        assert actual_ids.tolist() == [7, 11] and initial.all()
+        events.append("materialize")
+
+    cache = SimpleNamespace(
+        release_finished=released,
+        before_prefill=folded,
+        reset=lambda: events.append("reset"),
+    )
+    layer = SimpleNamespace(kda_replayssm=cache, kv_cache=(None, state))
+    other = SimpleNamespace(kda_replayssm=None)
+    runner.cache_config = SimpleNamespace(use_replayssm=True)
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={"kda": layer, "attn": other}
+    )
+    runner.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=["attn"]),
+            SimpleNamespace(layer_names=["kda"]),
+        ],
+    )
+    runner.block_tables = SimpleNamespace(
+        num_blocks=SimpleNamespace(np=torch.tensor([[0], [2]])),
+        block_tables=[None, SimpleNamespace(gpu=ids)],
+    )
+    runner.req_states = SimpleNamespace(
+        req_id_to_index={"request": 0},
+        remove_request=lambda _: 0,
+    )
+    runner.model_state = SimpleNamespace(
+        remove_request=lambda _: events.append("model_remove"),
+    )
+    runner.lora_state = SimpleNamespace(remove_request=lambda _: None)
+    runner.pooling_runner = runner.pp_handler = runner.encoder_cache = None
+    runner.prompt_logprobs_worker = None
+    if materialize:
+        runner._release_kda_replayssm("request", materialize=True)
+    runner._remove_request("request")
+    runner.reset_kda_replayssm()
+    assert events == (["materialize"] if materialize else []) + [
+        "discard",
+        "model_remove",
+        "reset",
+    ]
+
+
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.max_model_len = 262144

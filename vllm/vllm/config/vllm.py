@@ -74,6 +74,20 @@ ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset(
     {"DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM"}
 )
 
+# KDA models whose --use-replayssm is the exact W=16 window decode.
+KDA_REPLAYSSM_ARCHITECTURES = frozenset(
+    {"Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"}
+)
+
+
+def _uses_kda_replayssm(model_config, cache_config) -> bool:
+    return (
+        cache_config.use_replayssm
+        and model_config is not None
+        and model_config.architecture in KDA_REPLAYSSM_ARCHITECTURES
+    )
+
+
 DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
         "DeepseekV32MTPModel",
@@ -1258,6 +1272,8 @@ class VllmConfig:
         self.instance_id = f"{time.time_ns()}"
 
         self._resolve_mm_encoder_only()
+        # Before the model config hooks, which size the GDN state pages.
+        self.cache_config.use_gdn_replayssm = _uses_gdn_replayssm(self)
 
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
@@ -1481,6 +1497,12 @@ class VllmConfig:
                     "Async scheduling is disabled for ROCm DeepEP "
                     "high-throughput DBO because that combination can corrupt "
                     "DP+EP generation accuracy."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif _uses_kda_replayssm(self.model_config, self.cache_config):
+                logger.info_once(
+                    "Async scheduling is disabled for KDA ReplaySSM, whose "
+                    "window ownership follows the synchronous request lifecycle."
                 )
                 self.scheduler_config.async_scheduling = False
             else:
@@ -3211,8 +3233,19 @@ class VllmConfig:
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
         if self.cache_config.sketchssm is not None:
             self._validate_sketchssm()
+        self.cache_config.use_gdn_replayssm = _uses_gdn_replayssm(self)
         if not self.cache_config.use_replayssm:
             self.cache_config.use_kda_recoverssm = False
+            return self
+        if self.cache_config.use_gdn_replayssm:
+            # Runs on the SketchSSM kernels with dense heads.
+            self.cache_config.use_kda_recoverssm = False
+            if self.cache_config.sketchssm is not None:
+                raise ValueError("--use-replayssm and --sketchssm are exclusive")
+            self._check_sketchssm_kernels("--use-replayssm")
+            return self
+        if _uses_kda_replayssm(self.model_config, self.cache_config):
+            self._validate_kda_replayssm()
             return self
         self.cache_config.use_kda_recoverssm = self.num_speculative_tokens > 0
 
@@ -3286,6 +3319,10 @@ class VllmConfig:
                 "--sketchssm is not supported for architecture "
                 f"{self.model_config.architecture!r}"
             )
+        self._check_sketchssm_kernels("--sketchssm")
+
+    def _check_sketchssm_kernels(self, flag: str) -> None:
+        """Reject what the SketchSSM decode kernels do not support."""
         unsupported = []
         if (
             self.kv_transfer_config is not None
@@ -3307,7 +3344,56 @@ class VllmConfig:
         if self.parallel_config.tensor_parallel_size > 1:
             unsupported.append("tensor parallelism")
         if unsupported:
-            raise ValueError("--sketchssm does not support " + ", ".join(unsupported))
+            raise ValueError(f"{flag} does not support " + ", ".join(unsupported))
+
+
+    def _validate_kda_replayssm(self) -> None:
+        unsupported = []
+        if self.cache_config.sketchssm is not None:
+            unsupported.append("--sketchssm")
+        if self.cache_config.replayssm_buffer_len != 16:
+            unsupported.append("a --replayssm-buffer-len other than 16")
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
+        ):
+            unsupported.append("KV connectors")
+        if self.cache_config.mamba_cache_mode != "none":
+            unsupported.append("Mamba prefix caching")
+        if self.num_speculative_tokens > 0:
+            unsupported.append("speculative decoding")
+        if not self.use_v2_model_runner:
+            unsupported.append("Model Runner V1")
+        if self.scheduler_config.async_scheduling:
+            unsupported.append("async scheduling")
+        if self.cache_config.mamba_ssm_cache_dtype != "float32":
+            unsupported.append("a non-float32 --mamba-ssm-cache-dtype")
+        if self.mamba_config.enable_stochastic_rounding:
+            unsupported.append("stochastic rounding of the SSM state")
+        if self.model_config.dtype != torch.bfloat16:
+            unsupported.append("non-bfloat16 activations")
+        parallel = self.parallel_config
+        if (
+            parallel.tensor_parallel_size > 1
+            or parallel.pipeline_parallel_size > 1
+            or parallel.data_parallel_size > 1
+        ):
+            unsupported.append("tensor/pipeline/data parallelism")
+        if unsupported:
+            raise ValueError(
+                "KDA ReplaySSM (--use-replayssm on "
+                f"{self.model_config.architecture}) does not support "
+                + ", ".join(unsupported)
+            )
+
+
+def _uses_gdn_replayssm(config: VllmConfig) -> bool:
+    """Whether ``--use-replayssm`` runs GDN layers on the SketchSSM kernels."""
+    return bool(
+        config.cache_config.use_replayssm
+        and config.model_config is not None
+        and config.model_config.supports_gdn_replayssm
+    )
 
 
 _current_vllm_config: VllmConfig | None = None

@@ -34,6 +34,14 @@ __device__ __forceinline__ sketch_t sketch_round(float x) {
     return x;
 #endif
 }
+// x minus its stored sketch value (exact): the rounding residual of a dense head's rows
+__device__ __forceinline__ float sketch_residual(float x) {
+#if SKETCH_BF16
+    return x - __bfloat162float(__float2bfloat16_rn(x));
+#else
+    return 0.f;
+#endif
+}
 #define SK 128
 #define SV 128
 // SketchSSM window W (the build passes it): any multiple of 16, folded in 16-row tiles
@@ -489,7 +497,12 @@ gdn_flush_warp_kernel(
     const int sidx = slots[row];
     const int cidx = meta[row];
     const int m = sk_mh[hv];
-    const bool exact = m > 0;
+    // Dense heads with BF16 rows (u_off >= 0) stored full updates computed from those rows S~ (S rounded to bf16 by
+    // the build and the flush): the WY form erases only the rounding residual, X = D rep - ((S - S~) K) T''. Dense
+    // heads without rows (ReplaySSM) stored exact updates.
+    const bool dense_rows = m == 0 && layout[(long)hv * 4] >= 0;
+    const bool exact = m > 0 || dense_rows;
+    const int urows = dense_rows ? SK : m;                     // U rows written from S
     __nv_bfloat16* sKr = (__nv_bfloat16*)w1sm;                 // [W][KPB]
     __nv_bfloat16* sKt = sKr + WMAX * KPB;                     // [128][WPB]
     float* sKlo = (float*)(sKt + 128 * WPB);                   // [128]  remainder of the fp32 current key (row W-1) after bf16 rounding
@@ -820,9 +833,12 @@ gdn_flush_warp_kernel(
                 #pragma unroll
                 for (int nt = 0; nt < 2 * W1_NT; ++nt) bq[nt] = bf16x2_f2(sKr + (8 * nt + g) * KPB + 8 * q + 2 * c);
                 float (*Pq)[4] = P[q % NCHN];
+                float sq4[4];                                  // S, or S - S~ for dense rows
                 #pragma unroll
-                for (int nt = 0; nt < 2 * W1_NT; ++nt) mma_tf32_c(Pq[nt], acc[q], bq[nt].x, bq[nt].y);
-                if (!W1_KBF16) { const float2 bl = *(const float2*)(sKlo + 8 * q + 2 * c); mma_tf32_c(P[NCHN - 1][2 * W1_NT - 1], acc[q], (g == 7) ? bl.x : 0.f, (g == 7) ? bl.y : 0.f); }
+                for (int e = 0; e < 4; ++e) sq4[e] = dense_rows ? sketch_residual(acc[q][e]) : acc[q][e];
+                #pragma unroll
+                for (int nt = 0; nt < 2 * W1_NT; ++nt) mma_tf32_c(Pq[nt], sq4, bq[nt].x, bq[nt].y);
+                if (!W1_KBF16) { const float2 bl = *(const float2*)(sKlo + 8 * q + 2 * c); mma_tf32_c(P[NCHN - 1][2 * W1_NT - 1], sq4, (g == 7) ? bl.x : 0.f, (g == 7) ? bl.y : 0.f); }
             }
             if constexpr (NCHN == 2) {
                 #pragma unroll
@@ -897,17 +913,17 @@ gdn_flush_warp_kernel(
             mma_tf32(acc[nt], xa[W1_NT - 1][1][0], xa[W1_NT - 1][1][1], xa[W1_NT - 1][1][2], xa[W1_NT - 1][1][3], 0.f, bl);
             }
         }
-        // ── writes: state block, sketch rows U[L][v] = S'[v][L] (L < m), exact-output partial ──
+        // ── writes: state block, sketch rows U[L][v] = S'[v][L] (L < m; all K for dense rows), exact-output partial ──
         if (!(W1_ABLATE & 4)) w1_store_tile(acc, sp + (long)v0 * SK, g, c);   // timing only: no state store
         if (!W1_NOSKETCH && !(W1_NOSK & 1) && exact) {
             sketch_t* pv = pu_l + v0;
             #pragma unroll
             for (int nt = 0; nt < 16; ++nt) {
-                if (8 * nt >= m) break;
+                if (8 * nt >= urows) break;
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     const int L = 8 * nt + 2 * c + (e & 1);
-                    if (L < m) pv[(8 * nt + (e & 1)) * SV + 8 * (e >> 1)] = sketch_round(acc[nt][e]);
+                    if (L < urows) pv[(8 * nt + (e & 1)) * SV + 8 * (e >> 1)] = sketch_round(acc[nt][e]);
                 }
             }
         }
@@ -981,7 +997,7 @@ gdn_flush_warp_kernel(
             }
         }
     }
-    if (!(W1_NOSKETCH || (W1_NOSK & 8) || !exact)) {
+    if (!(W1_NOSKETCH || (W1_NOSK & 8) || m == 0)) {
     // ── Gram rows into the stats region ──
     __syncwarp();
     if (c < 2) {                                               // rows k = 16 mt + g (+8), cols j = 2 c + (e & 1)

@@ -141,16 +141,20 @@ class Harness:
                     hq = bf(s0[:, :m]) @ (r.coeff[h] @ qh - kq @ ff - ft * ktq)
                     dc = bt * (v[bi, h] - at * sk)
                     r.F[h].append(bf(ft))
-                else:
-                    hq, dc = s0 @ qh, bt * (v[bi, h] - at * (tot * (s0 @ kh) + sk))
+                else:  # dense: the BF16 rows of s0
+                    hq, hk = bf(s0) @ qh, bf(s0) @ kh
+                    dc = bt * (v[bi, h] - at * (tot * hk + sk))
                 expected[bi, h], exp_d[s, h] = at * (tot * hq + sq) + dc * ktq, dc
                 if t == W - 1:  # exact flush: W erases and updates from s0
                     keys, betas = torch.cat([keys, bf(kh)[None]]), br[r.meta, h]
                     gates, betas[-1] = torch.cat([g, at.log()[None]]), bt
-                    st = s0 * (1 if m else gates.exp().prod())
-                    for j in range(W if m else 0):
+                    # Dense heads stored full updates from bf(s0): erase the rest.
+                    st = s0 if m else s0 - bf(s0)
+                    for j in range(W):
                         erase = (st @ keys[j])[:, None] * keys[j][None, :]
                         st = gates[j].exp() * (st - betas[j] * erase)
+                    if not m:
+                        st += bf(s0) * gates.exp().prod()
                     rep = (gates.sum() - gates.cumsum(0)).exp()[:, None]
                     exp_s[s, h] = st + (torch.cat([ds, dc[None]]) * rep).T @ keys
                     expected[bi, h] = exp_s[s, h] @ qh
@@ -192,3 +196,41 @@ def test_gdn_sketch_decode(backend, window, dtype, widths, degenerate):
         rows += [PAD] * (4 - len(rows))
         rows = [rows[i] for i in torch.randperm(4, generator=gen).tolist()]
         hn.step(rows, [(n - r.start) % window if r.slot else 0 for r in rows])
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_gdn_dense_rows(backend):
+    """Dense heads read their BF16 rows on non-flush steps, not the FP32 state;
+    the build and the flush write the rows as the state rounded to BF16."""
+    hn = Harness(backend, 16)
+    reqs = [Request(2, 4), Request(6, 0)]
+    dense = [h for h, m in enumerate(WIDTHS) if m == 0]
+
+    def check_rows():
+        for r in reqs:
+            for h in dense:
+                u_off = int(hn.tables.layout[h, 0])
+                rows = hn.sketch.u[r.meta, u_off : u_off + K * V].view(K, V)
+                assert torch.equal(rows, hn.state[r.slot, h].T.bfloat16())
+
+    hn.build(reqs, [1, 1])
+    check_rows()
+    s = hn.sketch
+    for t in range(hn.W):
+        mix, a, b = hn.inputs(len(reqs))
+        out = torch.empty(len(reqs), hn.HV, V, dtype=hn.dtype, device="cuda")
+        step = hn.decode(mix, a, b, out, reqs, [t] * len(reqs))
+        if t == 3:
+            buffers = [hn.state, hn.dr, hn.kr, hn.gr, s.fs, s.beta]
+            saved = [x.clone() for x in buffers]
+            step()
+            expected = out.clone()
+            for x, y in zip(buffers, saved):
+                x.copy_(y)
+            hn.state[:, dense] = hn.state[:, dense] * 3 + 1
+            step()
+            assert torch.equal(out, expected)
+            hn.state.copy_(saved[0])
+        else:
+            step()
+    check_rows()  # rebuilt by the flush at t = W - 1

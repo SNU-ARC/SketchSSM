@@ -8,6 +8,14 @@ Per-request sketches are indexed by the persistent request index; the window
 rings live next to the state in the Mamba cache page. For ``W > 16`` the
 ``d_ring`` rows of 8-row chunk ``c >= 1`` are rebased to ``prefix[8 c - 1]``
 to keep their exponents bounded.
+
+Dense heads (rank 0 or 128) keep, like Mamba-2's, all their state rows in BF16
+(the per-request ``dense`` buffer), rebuilt from the FP32 state at each flush
+and after prefill. Their FP32 state changes only at flushes, by the exact
+fold of the window's raw rows; a non-flush step reads the BF16 rows and
+replays the window. Their FP32 replay rows ``delta_t`` (the value side of the
+window's WY factors) take the head's ``u_ring`` (rows ``t < W / 2``) and
+``d_ring`` (rows ``t >= W / 2``) bytes.
 """
 
 import math
@@ -119,10 +127,26 @@ class KDASketchTables(torch.nn.Module):
         )
         self.register_buffer("frame_gk", _pack_frames(frames, cpu), persistent=False)
         self.register_buffer("heads_all_d", self.heads_all.to(device), persistent=False)
+        # Dense heads: (head, row of the dense buffer), row = index in this list.
+        dense = torch.where(cpu == 0)[0]
+        self.dense_heads = dense.to(torch.int32).contiguous()
+        dense_rows = torch.full_like(cpu, -1)
+        dense_rows[dense] = torch.arange(dense.numel(), device="cpu")
+        self.register_buffer(
+            "dense_rows", dense_rows.to(device=device, dtype=torch.int32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "dense_heads_d", self.dense_heads.to(device), persistent=False
+        )
 
     @property
     def num_sketch_heads(self) -> int:
         return self.heads_all.numel()
+
+    @property
+    def num_dense_heads(self) -> int:
+        return self.dense_heads.numel()
 
     def sketch_specs(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
         """Per-request ``name: (shape, dtype)`` of the sketch."""
@@ -131,6 +155,7 @@ class KDASketchTables(torch.nn.Module):
             "u": ((h, g, d), torch.bfloat16),
             "phi": ((h, g, d), torch.bfloat16),
             "f": ((h, g, w), torch.bfloat16),
+            "dense": ((self.num_dense_heads, d, d), torch.bfloat16),
         }
 
 
@@ -209,6 +234,8 @@ class KDASketchArgs:
     u: torch.Tensor
     phi: torch.Tensor
     f: torch.Tensor
+    # BF16 state rows of the dense heads: (reqs, num_dense_heads, V, K).
+    dense: torch.Tensor
     tables: KDASketchTables
 
     @classmethod
@@ -244,7 +271,7 @@ def _fold_window_kernel(Slots, Pos, State, KR, VR, PrefixR, BR, Ranks,
                         W: tl.constexpr, BV: tl.constexpr, S0, S1,
                         S2: tl.constexpr, S3: tl.constexpr, RK, RV, RP,
                         RB):  # fmt: skip
-    # Apply a sketch head's pending window rows ``t < pos`` to its state.
+    # Apply a head's pending window rows ``t < pos`` to its state.
     row = tl.program_id(0)
     head = tl.program_id(1)
     block = tl.program_id(2)
@@ -252,7 +279,7 @@ def _fold_window_kernel(Slots, Pos, State, KR, VR, PrefixR, BR, Ranks,
     if page > 0:
         count = tl.load(Pos + row)
         ready = count > 0
-        if ready & (tl.load(Ranks + head) > 0):
+        if ready:
             kk = tl.arange(0, K)
             vv = block * BV + tl.arange(0, BV)
             sp = (

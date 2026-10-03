@@ -61,13 +61,19 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
     assert build_attn_metadata.call_args.kwargs["positions"] is positions
 
 
+@pytest.mark.parametrize("gdn_replayssm", [False, True])
 def test_prepare_attn_forwards_sketchssm_metadata(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, gdn_replayssm: bool
 ) -> None:
-    """SketchSSM rows get their ring origin and persistent request index."""
+    """SketchSSM (and GDN ReplaySSM) rows get their ring origin and persistent
+    request index."""
     state = object.__new__(MambaHybridModelState)
     state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
-    state.cache_config = CacheConfig(sketchssm="unused.pt")
+    if gdn_replayssm:
+        state.cache_config = CacheConfig(use_replayssm=True)
+        state.cache_config.use_gdn_replayssm = True
+    else:
+        state.cache_config = CacheConfig(sketchssm="unused.pt")
     state.max_model_len = 8192
     state._align_mode = False
     state.recoverssm = None

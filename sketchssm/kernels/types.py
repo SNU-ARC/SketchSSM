@@ -31,7 +31,10 @@ class Mamba2Sketch(Protocol):
 
 class GDNTables(Protocol):
     ranks: torch.Tensor
-    layout: torch.Tensor  # (HV, 4) int32
+    # (HV, 4) int32 (u_off, phi_off, fs_off, FG). A dense head (rank 0) with
+    # u_off >= 0 keeps BF16 rows of its full state at u_off, read on non-flush
+    # steps; with u_off -1 (ReplaySSM) it reads the FP32 state.
+    layout: torch.Tensor
     rank_cap: int
     window: int
 
@@ -59,6 +62,11 @@ class KDATables(Protocol):
     # (heads, rank bucket, head base) of each flush launch.
     flush_groups: Sequence[tuple[torch.Tensor, int, int]]
     num_sketch_heads: int
+    # Dense heads (rank 0): their ids in dense-row order (device int32), the
+    # dense row of each head or -1 (device int32, (H,)), and their count.
+    dense_heads_d: torch.Tensor
+    dense_rows: torch.Tensor
+    num_dense_heads: int
 
 
 class KDASketch(Protocol):
@@ -67,6 +75,7 @@ class KDASketch(Protocol):
     u: torch.Tensor
     phi: torch.Tensor
     f: torch.Tensor
+    dense: torch.Tensor  # (reqs, num_dense_heads, V, K) BF16 state rows
     tables: KDATables
 
 
