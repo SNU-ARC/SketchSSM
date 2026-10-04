@@ -37,6 +37,10 @@ typedef __nv_bfloat16 bf16;
 // SUPER_NF_BF16_UW=1: packed sketch rows (U) and coefficient maps (W) are stored as bf16.
 // Both are regenerated from the fp32 state at every flush, so the rounding does not
 // accumulate across steps; the recurrent state itself stays fp32.
+// Ridge of the coefficient solve (coefficients in the orthonormal sketch basis).
+#ifndef SK_RIDGE
+#define SK_RIDGE .003f
+#endif
 #ifndef UW_BF16
 #define UW_BF16 0
 #endif
@@ -548,12 +552,12 @@ __device__ void finish(int lane, int m, long meta_row, int woff, int aoff, const
     float r = en[i] - z0[i] * z0[i] - z1[i] * z1[i] - z2[i] * z2[i] - z3[i] * z3[i];
     r = r > 0.f ? r : 0.f;
     res[i] = j < mp ? 0.f : r;
-    den[i] = res[i] + .1f;
+    den[i] = res[i] + SK_RIDGE;
     a[i] = fdiv(res[i], den[i]);
     b0[i] = j < m ? fdiv(z0[i], den[i]) : 0.f;
     b1[i] = b2[i] = b3[i] = 0.f;
     g1[i] = g2[i] = g3[i] = 0.f;
-    fac[i] = j < m ? fdiv(.1f, den[i]) : 1.f;
+    fac[i] = j < m ? fdiv(SK_RIDGE, den[i]) : 1.f;
   }
   float zb00 = 0.f;
   #pragma unroll

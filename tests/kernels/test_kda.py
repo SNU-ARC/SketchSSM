@@ -81,7 +81,7 @@ def coefficient(state, frame, rank, pivots=4):
     residual[: min(rank, pivots)] = 0
     metric = z.T @ z + torch.diag(residual)
     a = torch.linalg.solve(
-        metric[:rank, :rank] + 0.1 * torch.eye(rank, dtype=torch.float64),
+        metric[:rank, :rank] + 0.003 * torch.eye(rank, dtype=torch.float64),
         metric[:rank, :],
     )
     return frame.double() @ a.T

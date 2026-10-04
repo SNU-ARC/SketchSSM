@@ -4,11 +4,13 @@
 
 Per request, the oracle solves the four-pivot residual-diagonal coefficient
 system of the window-start state directly, tracks the projected erase history,
-and applies each flush as the exact sequence of delta-rule erases and updates.
-Dense heads read the BF16 rows of the window-start state; their flush erases
-the rounding residual of those rows.
-Each step reads the kernels' own BF16 ring history, so every step is checked
-against the exact arithmetic of its inputs. Tolerances are the reference check's.
+and applies each flush as the exact delta-rule recurrence of the window's
+inputs (the BF16 keys and values as they are), in the rotated key frame of a
+random orthogonal frame R per key head (q and k arrive unrotated; the kernels
+get their FP32 rotation). Dense heads read the BF16 rows of the window-start
+state. Each step reads the kernels' own BF16 d ring history, so every step is
+checked against the exact arithmetic of its inputs. Output tolerances are the
+reference check's; the flushed state is checked at FP32 accuracy.
 """
 
 import pytest
@@ -40,13 +42,24 @@ WINDOWS = [32, 64]
 WINDOW_RATIOS = [3, 1]
 
 
+def frames_for(h: int, seed: int = 5) -> torch.Tensor:
+    """Random orthogonal frames R ``(h, K, K)`` (FP32)."""
+    g = torch.Generator().manual_seed(seed)
+    q, _ = torch.linalg.qr(torch.randn(h, K, K, generator=g, dtype=torch.float64))
+    return q.float()
+
+
+def unit(x: torch.Tensor) -> torch.Tensor:
+    return x / torch.sqrt(x.square().sum(-1, keepdim=True) + 1e-6)
+
+
 def fit(widths: list[int], hpg: int) -> list[int]:
     """``widths`` extended cyclically to whole groups of ``hpg`` value heads."""
     return [widths[i % len(widths)] for i in range(-(-len(widths) // hpg) * hpg)]
 
 
 def coefficient(s: torch.Tensor, m: int) -> torch.Tensor | None:
-    """FP64 four-pivot residual-diagonal coefficient map (ridge 0.1)."""
+    """FP64 four-pivot residual-diagonal coefficient map (ridge 0.003)."""
     if m == 0:
         return None
     if m == K:
@@ -67,7 +80,7 @@ def coefficient(s: torch.Tensor, m: int) -> torch.Tensor | None:
     res[: min(m, 4)] = 0
     gram = z.T @ z + torch.diag(res)
     eye = torch.eye(m, dtype=torch.float64)
-    return torch.linalg.solve(gram[:m, :m] + 0.1 * eye, gram[:m])
+    return torch.linalg.solve(gram[:m, :m] + 0.003 * eye, gram[:m])
 
 
 def relative(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -93,12 +106,14 @@ class Request:
         self.s0: torch.Tensor | None = None
         self.coeff: dict[int, torch.Tensor | None] = {}
         self.F: dict[int, list[torch.Tensor]] = {}
+        self.vals: dict[int, list[torch.Tensor]] = {}  # the window's values so far
 
 
 class Harness:
     """One GDN layer, its requests and the oracle's bookkeeping."""
 
-    def __init__(self, dtype, widths, degenerate=False, seed=17, hpg=3, window=W):
+    def __init__(self, dtype, widths, degenerate=False, seed=17, hpg=3, window=W,
+                 rotate=True):  # fmt: skip
         torch.manual_seed(seed)
         assert len(widths) % hpg == 0
         self.dtype, self.widths, self.hpg, self.W = dtype, widths, hpg, window
@@ -116,11 +131,20 @@ class Harness:
             state[:, 2] = 0
         self.state = state
         with torch.device("cuda"):
-            self.tables = GDNSketchTables(torch.tensor(widths), self.H, window)
+            self.tables = GDNSketchTables(
+                torch.tensor(widths), self.H, window, dense_rows=rotate
+            )
         self.sketch = GDNSketchArgs.allocate(self.tables, NR, "cuda")
+        # R per key head; frames_t = R^T (None: no rotation, as for ReplaySSM)
+        self.R = frames_for(self.H).double() if rotate else None
+        self.frames_t = (
+            self.R.transpose(-1, -2).float().contiguous().cuda() if rotate else None
+        )
         nan = float("nan")
-        self.dr = torch.full((NX, self.HV, window, V), nan, device="cuda").bfloat16()
-        self.kr = torch.full((NX, self.H, window, K), nan, device="cuda").bfloat16()
+        # d ring: W BF16 rows, then W fp16 residual rows; k ring: W raw BF16 keys, then
+        # W fp16 rows each of hi and lo of 2^10 x the unit keys in the rotated frame
+        self.dr = torch.full((NX, self.HV, 2 * window, V), nan, device="cuda").bfloat16()
+        self.kr = torch.full((NX, self.H, 3 * window, K), nan, device="cuda").bfloat16()
         self.gr = torch.zeros(NX, self.HV, window, device="cuda")
         self.al = torch.randn(self.HV, device="cuda") * 0.05
         self.bias = torch.zeros(self.HV, device="cuda")
@@ -139,6 +163,7 @@ class Harness:
         for h, m in enumerate(self.widths):
             r.coeff[h] = coefficient(r.s0[h], m)
             r.F[h] = []
+            r.vals[h] = []
             if m not in (0, K):
                 actual = stored_coefficient(self.tables, self.sketch.phi[r.meta], h, m)
                 err = relative(actual, r.coeff[h])
@@ -148,17 +173,31 @@ class Harness:
 
     def inputs(self, batch):
         H, HV, dt = self.H, self.HV, self.dtype
-        mix = (torch.randn(batch, 2 * H * K + HV * V, device="cuda") * 0.25).to(dt)
+        # BF16-valued activations also for FP32 io: the key ring keeps the keys in
+        # BF16, so the flush is exact for BF16 activations (vLLM's model dtype)
+        mix = (torch.randn(batch, 2 * H * K + HV * V, device="cuda") * 0.25)
+        mix = mix.bfloat16().to(dt)
         a = (-3 + torch.randn(batch, HV, device="cuda") * 0.2).to(dt)
         b = (torch.randn(batch, HV, device="cuda") * 0.5).to(dt)
         return mix, a, b
+
+    def qk(self, mix: torch.Tensor) -> torch.Tensor | None:
+        """FP32 R q and R k ``(batch, 2, H, K)`` of the unrotated inputs."""
+        if self.frames_t is None:
+            return None
+        x = mix[:, : 2 * self.H * K].float().view(-1, 2, self.H, K)
+        return torch.einsum("bzhi,hij->bzhj", x, self.frames_t).contiguous()
 
     def decode(self, mix, a, b, out, slots, pos, meta, rows, has_flush=True):
         kernels.gdn_decode(
             mix, a, b, self.al, self.bias, out, self.state, self.dr, self.kr,
             self.gr, slots, pos, meta, rows, self.sketch, K**-0.5,
-            has_flush_rows=has_flush,
+            has_flush_rows=has_flush, qk=self.qk(mix),
         )  # fmt: skip
+
+    def rotated(self, x: torch.Tensor) -> torch.Tensor:
+        """Key-head vectors ``(..., H, K)`` in the rotated frame (FP64)."""
+        return x if self.R is None else torch.einsum("hjk,...hk->...hj", self.R, x)
 
     def step(self, rows: list[Request | None], positions: list[int]) -> None:
         """One decode step of ``rows`` (None = padding row), checked."""
@@ -168,15 +207,17 @@ class Harness:
             if r is not None and p == 0:
                 self.window_start(r)
         mix, a, b = self.inputs(batch)
-        q = mix[:, : H * K].double().cpu().reshape(batch, H, K)
-        q = q / torch.sqrt(q.square().sum(-1, keepdim=True) + 1e-6) / K**0.5
-        k = mix[:, H * K : 2 * H * K].double().cpu().reshape(batch, H, K)
-        k = k / torch.sqrt(k.square().sum(-1, keepdim=True) + 1e-6)
+        raw_k = mix[:, H * K : 2 * H * K].double().cpu().reshape(batch, H, K)
+        q = self.rotated(unit(mix[:, : H * K].double().cpu().reshape(batch, H, K)))
+        q = q / K**0.5
+        k = self.rotated(unit(raw_k))
         v = mix[:, 2 * H * K :].double().cpu().reshape(batch, HV, V)
         al, bias = self.al.double().cpu(), self.bias.double().cpu()
         alpha = torch.exp(-al.exp() * F.softplus(a.double().cpu() + bias))
-        beta = b.double().cpu().sigmoid().to(dt).double()
-        dr, kr, gr = (x.double().cpu() for x in (self.dr, self.kr, self.gr))
+        beta = b.double().cpu().sigmoid()
+        dr, gr = self.dr[:, :, :W].double().cpu(), self.gr.double().cpu()
+        kr = self.kr[:, :, :W].double().cpu().transpose(1, 2)
+        kr = self.rotated(unit(kr)).transpose(1, 2)
         br = self.sketch.beta.double().cpu()
         expected = torch.zeros(batch, HV, V, dtype=torch.float64)
         expected_d, expected_state = {}, {}
@@ -207,36 +248,33 @@ class Harness:
                     hq = s0[h, :, :m].to(torch.bfloat16).double() @ x
                     dc = bt * (v[bi, h] - at * sk)
                     r.F[h].append(ft.to(torch.bfloat16).double())
-                else:  # dense: the BF16 rows of s0
-                    s0b = s0[h].to(torch.bfloat16).double()
+                else:  # dense: the BF16 rows of s0 (without rows: s0 itself)
+                    s0b = s0[h].to(torch.bfloat16).double() if self.R is not None else s0[h]
                     hq = s0b @ qh
                     dc = bt * (v[bi, h] - at * (tot * (s0b @ kh) + sk))
                 expected[bi, h] = at * (tot * hq + sq) + dc * ktq
                 expected_d[s, h] = dc
+                r.vals[h].append(v[bi, h])
                 if t == W - 1:
-                    keys = torch.cat([keys, kh.to(torch.bfloat16).double()[None]], 0)
-                    ds = torch.cat([ds, dc[None]], 0)
-                    gates = torch.cat([g, at.log()[None]], 0)
-                    alphas = gates.exp()
-                    # Dense heads stored full updates from their BF16 rows:
-                    # only the rounding residual is erased.
-                    s0b = s0[h].to(torch.bfloat16).double()
-                    boundary = s0[h].clone() if m else s0[h] - s0b
+                    # exact flush: the window's recurrence from s0 on its inputs
+                    keys = torch.cat([keys, kh[None]], 0)
+                    vals = torch.stack(r.vals[h])
+                    alphas = torch.cat([g, at.log()[None]], 0).exp()
                     betas = torch.cat([br[r.meta, h, :t], bt[None]], 0)
-                    for st in range(W):
-                        erase = (boundary @ keys[st])[:, None] * keys[st][None, :]
-                        boundary = alphas[st] * (boundary - betas[st] * erase)
-                    if not m:
-                        boundary = boundary + s0b * alphas.prod()
-                    pre = gates.cumsum(0)
-                    replay = (pre[-1] - pre).exp()
-                    expected_state[s, h] = boundary + (ds * replay[:, None]).T @ keys
+                    st_ = s0[h].clone()
+                    for j in range(W):
+                        st_ = alphas[j] * st_
+                        st_ = st_ + (betas[j] * (vals[j] - st_ @ keys[j]))[:, None] * keys[j][None, :]
+                    expected_state[s, h] = st_
                     expected[bi, h] = expected_state[s, h] @ qh
         dev = "cuda"
         slots = [r.slot if r else 0 for r in rows]
         metas = [r.meta if r else 0 for r in rows]
         flush = [i for i, (r, p) in enumerate(zip(rows, positions)) if r and p == W - 1]
-        flush_rows = flush + [-1] * (batch - len(flush))
+        # padding -2 - n carries the flush count (the flush then splits few rows over
+        # more CTAs); FP32 io runs keep the plain -1 padding (count unknown)
+        pad = -1 if dt == torch.float32 else -2 - len(flush)
+        flush_rows = flush + [pad] * (batch - len(flush))
         out = torch.empty(batch, HV, V, device=dev, dtype=dt)
         before = self.state.clone()
         self.decode(
@@ -264,13 +302,23 @@ class Harness:
                     err = relative(self.dr[s, h, t].double().cpu(), d_ref)
                     self.maxring = max(self.maxring, err)
                     assert err < 0.004, ("ring", s, h, t, err)
-                k_ref = k[bi].to(torch.bfloat16).double()
-                assert relative(self.kr[s, :, t].double().cpu(), k_ref) < 0.002
+                # the key ring holds the input as it is
+                k_in = mix[bi, H * K : 2 * H * K].view(H, K).bfloat16()
+                assert torch.equal(self.kr[s, :, t], k_in)
             else:
                 target = torch.stack([expected_state[s, h] for h in range(HV)])
                 err = relative(self.state[s].double().cpu(), target)
                 self.maxflush = max(self.maxflush, err)
-                assert err < 4e-4, ("flush", s, err)
+                assert err < 2e-5, ("flush", s, err)
+            # flush-only rows of this step: d = hi + lo ulp(hi), unit key = (hi + lo) / 2^10
+            hi = self.dr[s, :, t].float()
+            ulp = torch.ldexp(torch.ones_like(hi), torch.frexp(hi)[1] - 8)
+            d_full = hi + self.dr[s, :, W + t].view(torch.float16).float() * ulp
+            d_ref = torch.stack([expected_d[s, h] for h in range(HV)])
+            assert relative(d_full.double().cpu(), d_ref) < 1e-5, ("d lo", s, t)
+            ku = self.kr[s, :, W + t].view(torch.float16).float()
+            ku = (ku + self.kr[s, :, 2 * W + t].view(torch.float16).float()) / 1024
+            assert relative(ku.double().cpu(), k[bi]) < 1e-6, ("unit key", s, t)
         untouched = [i for i in range(NX) if i not in slots or i == 0]
         assert torch.equal(self.state[untouched], before[untouched])
 
@@ -293,7 +341,7 @@ class Harness:
             out = torch.zeros(batch, self.HV, V, device=dev, dtype=self.dtype)
             s = self.sketch
             buffers = [self.state, self.dr, self.kr, self.gr, s.u, s.phi, s.fs,
-                       s.beta, s.current_d, s.current_k]  # fmt: skip
+                       s.beta]  # fmt: skip
 
             def execute():
                 self.decode(mix, a, b, out, slots, pos, metas, flush_rows)  # noqa: B023
@@ -348,9 +396,17 @@ def test_gdn_gate_window(dtype, widths, degenerate, hpg, window):
     run_gate(dtype, widths, degenerate, hpg, window)
 
 
-def run_gate(dtype, widths, degenerate, hpg, window):
+@pytest.mark.parametrize("hpg", [3, 1])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_gdn_no_frame(dtype, hpg):
+    """ReplaySSM layout: no frame (q and k unrotated throughout) and dense
+    heads without BF16 rows, reading the FP32 state at every step."""
+    run_gate(dtype, [0] * (2 * hpg), False, hpg, W, rotate=False)
+
+
+def run_gate(dtype, widths, degenerate, hpg, window, rotate=True):
     widths = fit(widths, hpg)
-    hn = Harness(dtype, widths, degenerate, hpg=hpg, window=window)
+    hn = Harness(dtype, widths, degenerate, hpg=hpg, window=window, rotate=rotate)
     W = window
     r0, r1 = Request(3, 1, 0), Request(1, 2, 0)
     hn.build([r0, r1])

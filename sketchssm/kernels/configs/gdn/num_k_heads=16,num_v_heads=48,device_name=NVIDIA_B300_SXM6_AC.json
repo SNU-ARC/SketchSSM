@@ -12,9 +12,8 @@
     },
     "flush": {
         "W1_MINB": 4,
-        "W1_KBF16": 1,
         "W1_SMEM_PAD": 0,
         "SKETCH_BF16": 1,
-        "ROWS_PER_PROGRAM": 4
+        "ROWS_PER_PROGRAM": 1
     }
 }

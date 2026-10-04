@@ -566,7 +566,7 @@ def _kda_sketch_finish_kernel(
             zr3 = tl.sum(c3[:, None] * y4, axis=0) * inv_s
             tl.debug_barrier()
             # Per rank g: z_j[g], the residual and the Cholesky sums of
-            # I + Z^T diag(1 / (res + 0.1)) Z.
+            # I + Z^T diag(1 / (res + ridge)) Z.
             s0 = tl.zeros([GCH], tl.float32)
             s1 = tl.zeros([GCH], tl.float32)
             s2 = tl.zeros([GCH], tl.float32)
@@ -603,7 +603,7 @@ def _kda_sketch_finish_kernel(
                 en = tl.load(sc + 1024 + gg, mask=gm, other=0.0)
                 res = en / safe - (z0 * z0 + z1 * z1 + z2 * z2 + z3 * z3)
                 res = tl.where(gm & (gg >= npiv), tl.maximum(res, 0.0), 0.0)
-                inv_den = 1.0 / (res + 0.1)
+                inv_den = 1.0 / (res + 0.003)
                 b0 = z0 * inv_den
                 b1 = z1 * inv_den
                 b2 = z2 * inv_den
@@ -651,7 +651,7 @@ def _kda_sketch_finish_kernel(
                 z2 = tl.load(sc + 2 * D + gg, mask=gm, other=0.0)
                 z3 = tl.load(sc + 3 * D + gg, mask=gm, other=0.0)
                 res = tl.load(sc + 1024 + gg, mask=gm, other=0.0)
-                inv_den = 1.0 / (res + 0.1)
+                inv_den = 1.0 / (res + 0.003)
                 y0 = z0 * inv_den * r00
                 y1 = (z1 * inv_den - l10 * y0) * r11
                 y2 = (z2 * inv_den - l20 * y0 - l21 * y1) * r22
@@ -660,7 +660,7 @@ def _kda_sketch_finish_kernel(
                 gm2 = (y2 - l32 * gm3) * r22
                 gm1 = (y1 - l21 * gm2 - l31 * gm3) * r11
                 gm0 = (y0 - l10 * gm1 - l20 * gm2 - l30 * gm3) * r00
-                fm1 = tl.where(gm, 0.1 * inv_den - 1.0, 0.0)
+                fm1 = tl.where(gm, 0.003 * inv_den - 1.0, 0.0)
                 omc = tl.load(
                     om + gg[:, None] * D + kk[None, :], mask=gm[:, None], other=0.0
                 )

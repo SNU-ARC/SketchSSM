@@ -25,7 +25,7 @@ from vllm.model_executor.layers.mamba.ops import sketchssm_mamba2 as sk
 from sketchssm import kernels
 from sketchssm.kernels import mamba2 as mk
 
-RIDGE = 0.1
+RIDGE = 0.003
 
 N, L = 128, 16
 NULL = 0

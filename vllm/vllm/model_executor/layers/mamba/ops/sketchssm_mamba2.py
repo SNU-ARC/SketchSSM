@@ -427,7 +427,7 @@ def _sketch_head(
         z3 = z3 / tl.sqrt(safe_mean)
         residual = tl.maximum(e - z0 * z0 - z1 * z1 - z2 * z2 - z3 * z3, 0.0)
         residual = tl.where(j < tl.minimum(m, P), 0.0, residual)
-        denominator = residual + 0.1
+        denominator = residual + 0.003  # ridge (branch ridge-0p003)
         a = residual / denominator
         b0 = tl.where(j < m, z0 / denominator, 0.0)
         g0 = b0 / (1.0 + tl.sum(z0 * b0))
@@ -465,7 +465,7 @@ def _sketch_head(
                     g2 = (y2 - l3_2 * g3) / l2_2
                     g1 = (y1 - l2_1 * g2 - l3_1 * g3) / l1_1
                     g0 = (y0 - l1_0 * g1 - l2_0 * g2 - l3_0 * g3) / l0_0
-        factor = tl.where(j < m, 0.1 / denominator, 1.0)
+        factor = tl.where(j < m, 0.003 / denominator, 1.0)
         tbase = tail + (meta.to(tl.int64) * WROWS + tl.load(w_offsets + h)) * K + j
         index = meta.to(tl.int64) * ((P + 1) * SM) + off + j
         if m <= 4:

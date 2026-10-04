@@ -14,7 +14,7 @@ from .kda import kda_cold_build, kda_decode, kda_supported
 from .mamba2 import mamba2_decode, mamba2_supported
 
 # Bumped on a breaking change to the API below.
-API_VERSION = 3
+API_VERSION = 4
 
 __all__ = [
     "API_VERSION",

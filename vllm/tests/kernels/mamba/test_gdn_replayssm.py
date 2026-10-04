@@ -170,12 +170,14 @@ def test_gdn_replayssm_decode(backend, h, hv):
     ).to(dev)
     sketch = common.GDNSketchArgs.allocate(tables, 5, dev)
     state = torch.randn(nx, hv, V, K, device=dev) * 0.12
+    # d ring (2 W rows), k ring (3 W rows), g ring; the research kernel's are W rows
     rings = [
-        torch.zeros(nx, hv, W, V, device=dev, dtype=torch.bfloat16),
-        torch.zeros(nx, h, W, K, device=dev, dtype=torch.bfloat16),
+        torch.zeros(nx, hv, 2 * W, V, device=dev, dtype=torch.bfloat16),
+        torch.zeros(nx, h, 3 * W, K, device=dev, dtype=torch.bfloat16),
         torch.zeros(nx, hv, W, device=dev),
     ]
-    state_r, rings_r = state.clone(), [x.clone() for x in rings]
+    state_r = state.clone()
+    rings_r = [rings[0][:, :, :W].clone(), rings[1][:, :, :W].clone(), rings[2].clone()]
     exact = {slot: state[slot].double().cpu() for slot, _, _ in reqs}
     A_log = torch.randn(hv, device=dev) * 0.3
     dt_bias = torch.randn(hv, device=dev) * 0.3
@@ -196,7 +198,9 @@ def test_gdn_replayssm_decode(backend, h, hv):
         wpos = torch.tensor(pos, dtype=torch.int32, device=dev)
         flush = [i for i, (r, p) in enumerate(zip(rows, pos)) if r[0] and p == W - 1]
         flush_rows = torch.tensor(
-            flush + [-1] * (rows_per_step - len(flush)), dtype=torch.int32, device=dev
+            flush + [-2 - len(flush)] * (rows_per_step - len(flush)),
+            dtype=torch.int32,
+            device=dev,
         )
         out = torch.empty(rows_per_step, hv, V, dtype=torch.bfloat16, device=dev)
         out_r = torch.empty_like(out)
@@ -215,7 +219,7 @@ def test_gdn_replayssm_decode(backend, h, hv):
         k = k.repeat_interleave(hv // h, 1)
         v = x[:, 2 * h * K :].view(-1, hv, V)
         g = -A_log.double().cpu().exp() * F.softplus(a.double().cpu() + dt_bias.cpu())
-        beta = b.float().sigmoid().bfloat16().double().cpu()
+        beta = b.double().sigmoid().cpu()
         for i, (slot, _, _) in enumerate(rows):
             if not slot:
                 assert not out[i].any() and not out_r[i].any()
@@ -237,9 +241,11 @@ def test_gdn_replayssm_decode(backend, h, hv):
         *(f"{k}: {e}" for k, e in err.items()),
         sep="\n  ",
     )
-    # BF16 outputs and BF16 ring rows (d, k), as in the research kernel.
+    # BF16 outputs; the research kernel keeps BF16 ring rows (d, k) and a BF16
+    # beta, the flush here replays the window exactly from the inputs.
     assert max(err[k].rel for k in ("out", "out_research")) < 6e-3
-    assert max(err[k].rel for k in ("state", "state_research")) < 4e-3
+    assert err["state_research"].rel < 4e-3
+    assert err["state"].rel < 2e-5
 
 
 def test_gdn_replayssm_module():
@@ -253,10 +259,11 @@ def test_gdn_replayssm_module():
         )
     assert sk is not None and sk.rotation_t is None
     assert not sk.tables.ranks.any()
-    mix = torch.randn(3, (2 * 2 + 6) * K, device="cuda", dtype=torch.bfloat16)
-    before = mix.clone()
-    sk.rotate_(mix)
-    assert torch.equal(mix, before)
+    state = torch.randn(3, 6, V, K, device="cuda")
+    before = state.clone()
+    sk.unrotate_state(state)
+    sk.rotate_state(state)
+    assert torch.equal(state, before)
     plain = CacheConfig(use_replayssm=True, replayssm_buffer_len=W)
     assert (
         GDNSketchSSM.maybe_create(
@@ -306,7 +313,6 @@ def _layer(vllm_config, kv_cache, weights, h, hv):
         "rearrange_mixed_qkv",
         "_forward_core",
         "_sketchssm_decode",
-        "_rotate_qk",
         "_forward_core_decode_non_spec",
     ):
         method = getattr(QwenGatedDeltaNetAttention, name)

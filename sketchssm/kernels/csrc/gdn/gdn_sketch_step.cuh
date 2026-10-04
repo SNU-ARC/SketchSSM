@@ -28,6 +28,7 @@ static_assert(WMAX >= 16 && WMAX % 16 == 0, "window must be a multiple of 16");
 #define NF_SMEM_PAD 0
 #endif
 #define FULL 0xffffffffu
+#define KSC 1024.f      // unit keys (|k_i| <= 1) go to the flush as fp16 hi + lo of k x 2^10
 
 template <typename T> __device__ __forceinline__ float to_f(T x);
 template <> __device__ __forceinline__ float to_f<float>(float x) { return x; }
@@ -181,14 +182,22 @@ gdn_step_kernel(
     const int* __restrict__ ssm_state_indices, const int* __restrict__ write_pos, float scale,
     const sketch_t* __restrict__ sk_ubar, const sketch_t* __restrict__ sk_phi,
     const int* __restrict__ sk_mh,
-    sketch_t* __restrict__ sk_fs, const int* __restrict__ sk_meta, float* __restrict__ beta_ring, float* current_d, float* current_k, const int4* __restrict__ layout,
-    int s_mix, int s_a, int s_b, int s_u_slot, int s_phi_slot, int s_fs_slot,
+    sketch_t* __restrict__ sk_fs, const int* __restrict__ sk_meta, float* __restrict__ beta_ring,
+    const float* __restrict__ qk_rot, const int4* __restrict__ layout,
+    int s_mix, int s_a, int s_b, int s_u_slot, int s_phi_slot, int s_fs_slot, int s_qk,
     long S_H0_SLOT, long S_D_SLOT, long S_K_SLOT, long S_G_SLOT)
 {
     // compile-time geometry: H = NF_H key heads, HV = NF_HV = HPG * H value heads, W = WMAX, K = V = 128;
     // one warp per value head of the key head (CTA).
     // Slot strides are runtime: vLLM packs conv/state/ring buffers of a layer in one cache page, so a slot's
     // state stride is the page, not HV*K*V (the raw fixture uses dense tensors).  Inner strides stay dense.
+    // q and k arrive unrotated and unnormalized. The key ring holds the keys as they are (BF16 input): ring dots
+    // are rotation invariant (unrotated keys, normalized in FP32 here); what meets the rotated state or sketch takes
+    // the FP32 rotated q and k of qk_rot ((batch, 2, H, K), row stride s_qk; null without a frame).
+    // Ring layouts per slot: d (HV, 2W, V): W BF16 rows d (read by the steps), then W fp16 rows of the residual
+    // d - bf16(d) in units of its bf16 ulp; k (H, 3W, K): W - 1 BF16 rows of the raw keys (read by the steps), then
+    // W rows each of fp16 hi and lo of KSC k~, k~ the unit key in the state's frame. All W rows of the fp16 parts are
+    // written; the flush alone reads them.
     constexpr int H = NF_H, HV = NF_HV, W = WMAX;
     using SM = Smem<K, V, HPG>;
     constexpr int NW = HPG;
@@ -199,6 +208,7 @@ gdn_step_kernel(
     constexpr int NGC = (W + 31) / 32;                   // window rows per lane: gates, replay weights
     constexpr bool NORM_X = 2 * NSW + 3 <= 32;           // norm dots ride the ring-key transpose (HPG >= 2)
     constexpr int NKV = Pow2<NORM_X ? 2 * NSW + 3 : 2 * NSW>::v;
+    constexpr int NKN = Pow2<NSW>::v;                    // ring-key norms: a second transpose-reduction
     constexpr int NG = (GT + 31) / 32;
     static_assert(K == 128 && V == 128, "K == V == 128");
     static_assert(GT % 4 == 0 && HPG >= 1 && HPG <= 8, "GT/HPG");
@@ -226,6 +236,11 @@ gdn_step_kernel(
         qc[0] = q4.x; qc[1] = q4.y; qc[2] = q4.z; qc[3] = q4.w;
         kc[0] = k4.x; kc[1] = k4.y; kc[2] = k4.z; kc[3] = k4.w;
     }
+    float4 qr4 = make_float4(0.f, 0.f, 0.f, 0.f), kr4 = qr4;     // FP32 rotated q, k (unnormalized)
+    if (qk_rot) {
+        const float* pr = qk_rot + (long)i_n * s_qk + (i_h * K + lane * CK);
+        qr4 = *((const float4*)pr); kr4 = *((const float4*)(pr + H * K));
+    }
     const float4 vv = ld4<TIO>(mixed_qkv + (long)i_n * s_mix + (2 * H * K + i_hv * V + lane * VL));
     const float a_val = ldx<NF_AB_CODE>(a, (long)i_n * s_a + i_hv);
     const float b_val = ldx<NF_AB_CODE>(b, (long)i_n * s_b + i_hv);
@@ -239,7 +254,7 @@ gdn_step_kernel(
 
     const float* pst = h0 + (long)sidx * S_H0_SLOT + i_hv * (K * V);
     __nv_bfloat16* bd = d_cache + (long)sidx * S_D_SLOT;
-    const __nv_bfloat16* pdr = bd + i_hv * (W * V);
+    const __nv_bfloat16* pdr = bd + i_hv * (2 * W * V);
     __nv_bfloat16* bk = k_cache + (long)sidx * S_K_SLOT;
     float* bg = g_cache + (long)sidx * S_G_SLOT;
     const sketch_t* bu = sk_ubar + (long)cidx * s_u_slot + lay.x;
@@ -256,7 +271,7 @@ gdn_step_kernel(
     const int nrk = (wph - s0k < NSW) ? (wph - s0k) : NSW;
     float kr[NSW][CK];
     {
-        const uint2* kb = (const uint2*)(bk + (i_h * W + s0k) * K + lane * CK);
+        const uint2* kb = (const uint2*)(bk + (i_h * 3 * W + s0k) * K + lane * CK);
         #pragma unroll
         for (int i = 0; i < NSW; ++i) {
             const uint2 r = (i < nrk) ? kb[i * (K / 4)] : make_uint2(0u, 0u);   // rows >= nrk never reach a stored dot
@@ -278,18 +293,25 @@ gdn_step_kernel(
     stage8<4>(wsm + SM::FS_OFF, (const unsigned char*)pf, fs_in_smem ? wph * FG * (int)sizeof(sketch_t) : 0, lane);   // erase rows 0..wph-1, pitch FG
 #endif
     cp_async_commit();
+#if !(NF_ABLATE & 64)
+    if (wp < W - 1 && warp == 0)                         // the key ring row: the input as it is (exact for BF16 inputs)
+        st4<__nv_bfloat16>(bk + (i_h * 3 * W + wp) * K + lane * CK, make_float4(kc[0], kc[1], kc[2], kc[3]));
+#endif
 
     // ---- gates, normalization ----
     const float xg = a_val + dtb;
-    const float sp = (xg <= 20.f) ? logf(1.f + expf(xg)) : xg;
+    const float sp = (xg <= 20.f) ? log1pf(expf(xg)) : xg;   // log1pf: not a fast-math intrinsic (the gate enters the state)
     const float g_val = -expf(Al) * sp;
     const float alpha = expf(g_val);
-    const float beta = round_to(1.f / (1.f + expf(-b_val)), NF_AB_CODE);
+    const float beta = 1.f / (1.f + expf(-b_val));      // FP32, as the reference decode
     if (beta_ring && lane == 0) beta_ring[(cidx * HV + i_hv) * W + wp] = beta;
-    // ---- raw dots (unnormalized q/k): ring keys (10 slots) + norms <q,q>, <k,k>, <q,k> (slots 10..12), one transpose-reduction ----
-    float kv[NKV];
+    // ---- raw dots (unnormalized q/k and ring keys): ring keys (10 slots) + norms <q,q>, <k,k>, <q,k> (slots 10..12),
+    //      one transpose-reduction; the ring keys' own norms in a second one ----
+    float kv[NKV], kn[NKN];
     #pragma unroll
     for (int i = 0; i < NKV; ++i) kv[i] = 0.f;
+    #pragma unroll
+    for (int i = 0; i < NKN; ++i) kn[i] = 0.f;
     float2 qk2[CK];
     #pragma unroll
     for (int c = 0; c < CK; ++c) qk2[c] = make_float2(qc[c], kc[c]);
@@ -297,9 +319,10 @@ gdn_step_kernel(
     #pragma unroll
     for (int i = 0; i < NSW; ++i) {
         float2 pp = make_float2(0.f, 0.f);           // (q dot, k dot)
+        float nr = 0.f;
         #pragma unroll
-        for (int c = 0; c < CK; ++c) pp = ffma2(make_float2(kr[i][c], kr[i][c]), qk2[c], pp);
-        kv[i] = pp.x; kv[NSW + i] = pp.y;
+        for (int c = 0; c < CK; ++c) { pp = ffma2(make_float2(kr[i][c], kr[i][c]), qk2[c], pp); nr = fmaf(kr[i][c], kr[i][c], nr); }
+        kv[i] = pp.x; kv[NSW + i] = pp.y; kn[i] = nr;
     }
 #endif
     static_assert(!NORM_X || 2 * NSW + 3 <= NKV, "norm slots");
@@ -308,6 +331,7 @@ gdn_step_kernel(
     for (int c = 0; c < CK; ++c) { nn = ffma2(qk2[c], qk2[c], nn); qkd = fmaf(qc[c], kc[c], qkd); }
     if constexpr (NORM_X) { kv[2 * NSW] = nn.x; kv[2 * NSW + 1] = nn.y; kv[2 * NSW + 2] = qkd; }
     const float kval = xposeN<NKV>(kv, lane);         // lane e holds slot e (e < NKV)
+    const float knrm = xposeN<NKN>(kn, lane);         // lane i holds |ring key s0k + i|^2 (i < NSW)
     float sq, sk, qk;
     if constexpr (NORM_X) { sq = __shfl_sync(FULL, kval, 2 * NSW); sk = __shfl_sync(FULL, kval, 2 * NSW + 1); qk = __shfl_sync(FULL, kval, 2 * NSW + 2); }
     else { sq = warp_sum(nn.x); sk = warp_sum(nn.y); qk = warp_sum(qkd); }   // HPG == 1: 30 ring slots fill the warp
@@ -316,42 +340,62 @@ gdn_step_kernel(
     #pragma unroll
     for (int c = 0; c < CK; ++c) { qc[c] *= q_sc; kc[c] *= k_rn; qk2[c] = make_float2(qc[c], kc[c]); }
     const float cur_kq = qk * q_sc * k_rn;
-    if (warp == 0) {
-        if (wp == W - 1) st4<float>(current_k + (cidx * H + i_h) * K + lane * CK, make_float4(kc[0], kc[1], kc[2], kc[3]));
-        else st4<__nv_bfloat16>(bk + (i_h * W + wp) * K + lane * CK, make_float4(kc[0], kc[1], kc[2], kc[3]));
-    }
-    {   // slot e < 2*NSW: dot (e < NSW ? q : k) with ring key s0k + (e mod NSW); scaled by the matching norm
+    {   // slot e < 2*NSW: dot (e < NSW ? q : k) with ring key s0k + (e mod NSW); scaled by both norms
         const int e = lane & (NKV - 1);
         const int i = (e < NSW) ? e : e - NSW;
         const float scl = (e < NSW) ? q_sc : k_rn;
-        if (lane < 2 * NSW && i < nrk) sKQK[e < NSW ? 0 : 1][s0k + i] = kval * scl;
+        const float rn_s = 1.f / sqrtf(__shfl_sync(FULL, knrm, i & (NKN - 1)) + 1e-6f);
+        if (lane < 2 * NSW && i < nrk) sKQK[e < NSW ? 0 : 1][s0k + i] = kval * scl * rn_s;
     }
     if constexpr (W > 16) {
         // ---- ring keys RS .. wp-1 in 16-row tiles (normalized q, k): one transpose-reduction per tile ----
-        constexpr int NSX = (16 + NW - 1) / NW, NKX = Pow2<2 * NSX>::v;
-        const __nv_bfloat16* kb = bk + i_h * W * K + lane * CK;
+        constexpr int NSX = (16 + NW - 1) / NW, NKX = Pow2<2 * NSX>::v, NKY = Pow2<NSX>::v;
+        const __nv_bfloat16* kb = bk + i_h * 3 * W * K + lane * CK;
         #pragma unroll 1
         for (int r0 = RS; r0 < wp; r0 += 16) {
             const int s0 = r0 + warp * NSX;
             const int nr = min(min(wp, r0 + 16) - s0, NSX);
-            float kx[NKX];
+            float kx[NKX], ky[NKY];
             #pragma unroll
             for (int i = 0; i < NKX; ++i) kx[i] = 0.f;
+            #pragma unroll
+            for (int i = 0; i < NKY; ++i) ky[i] = 0.f;
             #pragma unroll
             for (int i = 0; i < NSX; ++i) {
                 const uint2 r = (i < nr) ? *((const uint2*)(kb + (s0 + i) * K)) : make_uint2(0u, 0u);
                 const float kk4[4] = {bf_lo(r.x), bf_hi(r.x), bf_lo(r.y), bf_hi(r.y)};
                 float2 pp = make_float2(0.f, 0.f);
+                float nr2 = 0.f;
                 #pragma unroll
-                for (int c = 0; c < CK; ++c) pp = ffma2(make_float2(kk4[c], kk4[c]), qk2[c], pp);
-                kx[i] = pp.x; kx[NSX + i] = pp.y;
+                for (int c = 0; c < CK; ++c) { pp = ffma2(make_float2(kk4[c], kk4[c]), qk2[c], pp); nr2 = fmaf(kk4[c], kk4[c], nr2); }
+                kx[i] = pp.x; kx[NSX + i] = pp.y; ky[i] = nr2;
             }
             const float xv = xposeN<NKX>(kx, lane);
+            const float yv = xposeN<NKY>(ky, lane);
             const int e = lane & (NKX - 1);
             const int i = (e < NSX) ? e : e - NSX;
-            if (lane < 2 * NSX && i < nr) sKQK[e < NSX ? 0 : 1][s0 + i] = xv;
+            const float rn_s = 1.f / sqrtf(__shfl_sync(FULL, yv, i & (NKY - 1)) + 1e-6f);
+            if (lane < 2 * NSX && i < nr) sKQK[e < NSX ? 0 : 1][s0 + i] = xv * rn_s;
         }
     }
+
+    if (qk_rot) {                                        // the sketch and the state are read in the rotated frame
+        qc[0] = qr4.x * q_sc; qc[1] = qr4.y * q_sc; qc[2] = qr4.z * q_sc; qc[3] = qr4.w * q_sc;
+        kc[0] = kr4.x * k_rn; kc[1] = kr4.y * k_rn; kc[2] = kr4.z * k_rn; kc[3] = kr4.w * k_rn;
+        #pragma unroll
+        for (int c = 0; c < CK; ++c) qk2[c] = make_float2(qc[c], kc[c]);
+    }
+#if !(NF_ABLATE & 64)
+    if (warp == 0) {                                     // the unit key in the state's frame for the flush: fp16 hi + lo
+        __half* pk = (__half*)(bk + (i_h * 3 * W + W + wp) * K + lane * CK);
+        const __half2 h01 = __floats2half2_rn(KSC * kc[0], KSC * kc[1]), h23 = __floats2half2_rn(KSC * kc[2], KSC * kc[3]);
+        const float2 f01 = __half22float2(h01), f23 = __half22float2(h23);
+        const __half2 l01 = __floats2half2_rn(fmaf(KSC, kc[0], -f01.x), fmaf(KSC, kc[1], -f01.y));
+        const __half2 l23 = __floats2half2_rn(fmaf(KSC, kc[2], -f23.x), fmaf(KSC, kc[3], -f23.y));
+        *(uint2*)pk = make_uint2(*(const unsigned*)&h01, *(const unsigned*)&h23);
+        *(uint2*)(pk + W * K) = make_uint2(*(const unsigned*)&l01, *(const unsigned*)&l23);
+    }
+#endif
 
     // gate prefix over the window rows lane + 32 j; rep_s = exp(gtot - pre_s) for s < wp
     constexpr int SCN = W < 32 ? W : 32;
@@ -613,8 +657,21 @@ gdn_step_kernel(
         }
         st4<TIO>(p_o, make_float4(o[0], o[1], o[2], o[3]));
 #if !(NF_ABLATE & 64)
-        if (wp == W - 1) st4<float>(current_d + (cidx * HV + i_hv) * V + lane * VL, make_float4(dc[0], dc[1], dc[2], dc[3]));
-        else st4<__nv_bfloat16>(bd + (i_hv * W + wp) * V + lane * VL, make_float4(dc[0], dc[1], dc[2], dc[3]));
+        // d ring row (BF16, read by the steps) and its residual for the flush: lo = (d - hi) / ulp(hi) in fp16
+        // (|lo| <= 1/2; the flush rebuilds d - hi to 2^-12 of an ulp, i.e. 2^-20 of d)
+        st4<__nv_bfloat16>(bd + (i_hv * 2 * W + wp) * V + lane * VL, make_float4(dc[0], dc[1], dc[2], dc[3]));
+        {
+            float t[4];
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const float hi = __bfloat162float(__float2bfloat16_rn(dc[c]));
+                const unsigned e = (__float_as_uint(hi) >> 23) & 0xffu;
+                const float inv_ulp = __uint_as_float((261u - e) << 23);   // 2^(7 - exponent of hi)
+                t[c] = (e - 8u <= 245u) ? (dc[c] - hi) * inv_ulp : 0.f;     // 8 <= e <= 253
+            }
+            const __half2 t01 = __floats2half2_rn(t[0], t[1]), t23 = __floats2half2_rn(t[2], t[3]);
+            *(uint2*)(bd + (i_hv * 2 * W + W + wp) * V + lane * VL) = make_uint2(*(const unsigned*)&t01, *(const unsigned*)&t23);
+        }
         if (lane == 0) bg[i_hv * W + wp] = g_val;
 #endif
     }

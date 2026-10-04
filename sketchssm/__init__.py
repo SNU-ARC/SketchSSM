@@ -6,4 +6,4 @@
 ``sketchssm.calibration`` the offline calibration (basis and rank allocation).
 """
 
-__version__ = "0.1.9"
+__version__ = "0.1.10"

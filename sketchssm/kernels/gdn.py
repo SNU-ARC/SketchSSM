@@ -33,14 +33,16 @@ _STEP_CONFIG = dict(
     NF_PF_ROWS=0, NF_ABLATE=0, NF_SMEM_PAD=0, SKETCH_BF16=1,
 )  # fmt: skip
 _FLUSH_CONFIG = dict(
-    W1_MINB=4, W1_KBF16=1, W1_NOSKETCH=0, W1_ABLATE=0, W1_NOSK=0,
+    W1_MINB=4, W1_NOSKETCH=0, W1_ABLATE=0, W1_NOSK=0,
     W1_SMEM_PAD=0, SKETCH_BF16=1,
 )  # fmt: skip
 # Overrides below capability 10; the same heads-per-group scaling applies.
 _SM90_STEP = dict(NF_MINB=6, NF_UROWS=8)
 _SM90_FLUSH = dict(W1_MINB=1)
-# Flush rows per CTA of the flush row list (a launch knob, not a define).
-_FLUSH_ROWS_PER_PROGRAM = 4
+# Flush rows per CTA of the flush row list, and a cap on the CTAs per key head
+# (launch knobs, not defines).
+_FLUSH_ROWS_PER_PROGRAM = 1
+_FLUSH_CTAS = 256
 
 _DT_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 # Value heads per key head (one warp per value head of a key head in a CTA).
@@ -81,9 +83,9 @@ def flush_smem_bytes(config: dict, num_k_heads: int, num_v_heads: int,
     """Shared memory per CTA of the flush kernel (``W1_SMEM`` + pad)."""
     hpg = num_v_heads // num_k_heads
     tiles = window // 16
-    cta = window * 136 * 2 + 128 * (window + 8) * 2 + 128 * 4 + 256 * 4 + 128 * 4
-    t_bytes = 2 * 16 * 20 * 4 if window == 16 else tiles * (tiles + 1) // 2 * 1024
-    warp = 16 * 128 * 4 + 5 * 128 * 4 + t_bytes + (window - 1) * 32 + 96
+    cta = 2 * window * 136 * 2 + 256 * 4 + 128 * 4
+    t_bytes = 16 * 20 * 4 if window == 16 else tiles * (tiles + 1) // 2 * 1024
+    warp = 16 * 128 * 4 + 5 * 128 * 4 + t_bytes + window * 64 + 2 * window * 4
     return cta + hpg * warp + config["W1_SMEM_PAD"]
 
 
@@ -162,6 +164,7 @@ def default_config(
             room = _ctas_per_sm(smem(cfg, num_k_heads, num_v_heads, window), target)
             cfg[minb] = max(1, min(cfg[minb], room))
     flush["ROWS_PER_PROGRAM"] = _FLUSH_ROWS_PER_PROGRAM
+    flush["FLUSH_CTAS"] = _FLUSH_CTAS
     return step, flush
 
 
@@ -291,7 +294,8 @@ def step_spec(config: dict, io_dtype: torch.dtype) -> kn.Spec:
 
 def flush_spec(config: dict) -> kn.Spec:
     return kn.Spec.make("gdn_flush", "gdn/gdn_sketch_flush.cuh", config,
-                        ["gdn_flush_warp_kernel"], (), _FLUSH_PROBES)  # fmt: skip
+                        ["gdn_flush_warp_kernel", "gdn_finish_kernel"], (),
+                        _FLUSH_PROBES)  # fmt: skip
 
 
 def _knobs(h: int, hv: int, window: int, target: Target | None) -> tuple[dict, dict]:
@@ -314,6 +318,7 @@ def _step_config(h, hv, ab_code, p_code, bias_code, window, target=None) -> dict
 def _flush_config(h, hv, window, target=None) -> dict:
     config = dict(_knobs(h, hv, window, target)[1], W1_WARPS=hv // h, WMAX=window)
     config.pop("ROWS_PER_PROGRAM")
+    config.pop("FLUSH_CTAS", None)
     return config
 
 
@@ -367,25 +372,38 @@ def _flush_ext(h: int, hv: int, window: int = WINDOW):
 
 def flush_programs(batch: int, num_k_heads: int, num_v_heads: int,
                    window: int = WINDOW) -> int:  # fmt: skip
-    """CTAs (per key head) that walk a flush row list of ``batch`` entries."""
-    rows = tuned_config(num_k_heads, num_v_heads, window)[1]["ROWS_PER_PROGRAM"]
-    return max(1, -(-batch // rows))
+    """CTAs (per key head) that walk a flush row list of ``batch`` entries: one
+    per ``ROWS_PER_PROGRAM`` rows, at most ``FLUSH_CTAS``. When the row list
+    carries its flush count (padding ``-2 - n``), the CTAs split the values of
+    few flush rows among them."""
+    flush = tuned_config(num_k_heads, num_v_heads, window)[1]
+    rows, cap = flush["ROWS_PER_PROGRAM"], flush.get("FLUSH_CTAS", _FLUSH_CTAS)
+    # at least 4 CTAs, so that a single flush row is split 4 ways
+    return max(4, min(-(-batch // rows), cap))
 
 
 # mixed, a, b, ab_code, A_log, dt_bias, p_code, bias_code, out, state, d/k/g rings,
-# slots, pos, scale, u, phi, ranks, fs, meta, beta, current d/k, layout,
-# 6 int strides, 4 long strides
+# slots, pos, scale, u, phi, ranks, fs, meta, beta, rotated q/k, layout,
+# 7 int strides, 4 long strides
 _STEP_SIG = drv.Signature(
-    ["Q"] * 3 + ["i"] + ["Q"] * 2 + ["i", "i"] + ["Q"] * 7 + ["f"] + ["Q"] * 9
-    + ["i"] * 6 + ["q"] * 4
+    ["Q"] * 3 + ["i"] + ["Q"] * 2 + ["i", "i"] + ["Q"] * 7 + ["f"] + ["Q"] * 8
+    + ["i"] * 7 + ["q"] * 4
 )
-# state, d ring, current d, g ring, rows, n_rows, slots, meta, ranks, u, phi,
-# layout, phi stride, k ring, current k, beta, 7 strides, H, HV, G, query,
-# output, query stride, query_bf16, output_bf16, scale, emit_output
+# state, d ring, k ring, g ring, rows, n_rows, slots, meta, ranks, u, layout,
+# finish statistics, beta, 7 strides, H, HV, G, query, output, query stride,
+# query_bf16, output_bf16, scale, emit_output
 _FLUSH_SIG = drv.Signature(
-    ["Q"] * 5 + ["i"] + ["Q"] * 6 + ["q"] + ["Q"] * 3 + ["q"] * 7 + ["i"] * 3
+    ["Q"] * 5 + ["i"] + ["Q"] * 7 + ["q"] * 7 + ["i"] * 3
     + ["Q", "Q", "q", "?", "?", "f", "?"]
 )
+# finish statistics, rows, n_rows, meta, ranks, layout, phi, phi stride, HV,
+# flush CTAs per key head
+_FINISH_SIG = drv.Signature(["Q", "Q", "i"] + ["Q"] * 4 + ["q", "i", "i"])
+# Floats of the coefficient-finish statistics per flushed head (energy and 4
+# Gram rows).
+_FINISH_STATS = 5 * HEAD_DIM
+# CTAs (per 8 value heads) that walk the flush rows of the finish launch.
+_FINISH_PROGRAMS = 64
 _CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 
 
@@ -395,8 +413,8 @@ def _check(cond: bool, msg: str) -> None:
 
 
 def _step_launch(k: _Kernel, mixed, a, b, alog, bias, out, state, writes, keys, gates,
-                 index, pos, u, phi, widths, factors, meta, beta_ring, current_d,
-                 current_k, layout, rank_cap, scale) -> None:  # fmt: skip
+                 index, pos, u, phi, widths, factors, meta, beta_ring, qk, layout,
+                 rank_cap, scale) -> None:  # fmt: skip
     """The step launch (``step`` of the former C++ launcher)."""
     c = dict(k.spec.defines)
     nf_h, nf_hv, wmax = int(c["NF_H"]), int(c["NF_HV"]), int(c["WMAX"])
@@ -408,14 +426,18 @@ def _step_launch(k: _Kernel, mixed, a, b, alog, bias, out, state, writes, keys, 
            and _CODE.get(bias.dtype) == int(c["NF_BIAS_CODE"]),
            "gdn_step: compiled for other gate dtypes")  # fmt: skip
     _check(state.stride(1) == K * V and state.stride(2) == V and state.stride(3) == 1
-           and writes.stride(1) == wmax * V and writes.stride(2) == V and writes.stride(3) == 1
-           and keys.stride(1) == wmax * K and keys.stride(2) == K and keys.stride(3) == 1
+           and writes.stride(1) == 2 * wmax * V and writes.stride(2) == V and writes.stride(3) == 1
+           and keys.stride(1) == 3 * wmax * K and keys.stride(2) == K and keys.stride(3) == 1
            and gates.stride(1) == wmax and gates.stride(2) == 1,
            "gdn_step: dense per-slot state/ring layout required")  # fmt: skip
     _check(layout.dtype == torch.int32 and layout.is_contiguous() and layout.numel() == 4 * HV,
            "gdn_step: int32 [HV,4] layout required")  # fmt: skip
-    _check(writes.shape[2] == wmax and keys.shape[2] == wmax and gates.shape[2] == wmax,
-           f"gdn_step: compiled for window {wmax}")  # fmt: skip
+    _check(writes.shape[2] == 2 * wmax and keys.shape[2] == 3 * wmax and gates.shape[2] == wmax,
+           f"gdn_step: compiled for window {wmax} (d ring 2 W rows, k ring 3 W rows)")  # fmt: skip
+    _check(qk is None or (qk.dtype == torch.float32 and qk.shape[1:] == (2, H, K)
+                          and qk.stride(1) == H * K and qk.stride(2) == K
+                          and qk.stride(3) == 1 and qk.stride(0) < 2**31),
+           "gdn_step: FP32 (batch, 2, H, K) rotated q/k required")  # fmt: skip
     _check(index.stride(0) == 1 and meta.stride(0) == 1 and meta.dtype == torch.int32
            and u.stride(0) < 2**31 and phi.stride(0) < 2**31 and factors.stride(0) < 2**31,
            "gdn_step: 32-bit strides")  # fmt: skip
@@ -429,9 +451,10 @@ def _step_launch(k: _Kernel, mixed, a, b, alog, bias, out, state, writes, keys, 
         state.data_ptr(), writes.data_ptr(), keys.data_ptr(), gates.data_ptr(),
         index.data_ptr(), pos.data_ptr(), scale, u.data_ptr(), phi.data_ptr(),
         widths.data_ptr(), factors.data_ptr(), meta.data_ptr(),
-        beta_ring.data_ptr() if beta_ring is not None else 0, current_d.data_ptr(),
-        current_k.data_ptr(), layout.data_ptr(), mixed.stride(0), a.stride(0),
-        b.stride(0), u.stride(0), phi.stride(0), factors.stride(0), state.stride(0),
+        beta_ring.data_ptr() if beta_ring is not None else 0,
+        qk.data_ptr() if qk is not None else 0, layout.data_ptr(), mixed.stride(0),
+        a.stride(0), b.stride(0), u.stride(0), phi.stride(0), factors.stride(0),
+        qk.stride(0) if qk is not None else 0, state.stride(0),
         writes.stride(0), keys.stride(0), gates.stride(0),
     )  # fmt: skip
     drv.launch(fn, _STEP_SIG, (B, H, 1), (32 * (nf_hv // nf_h), 1, 1), k.probes["smem"],
@@ -439,8 +462,8 @@ def _step_launch(k: _Kernel, mixed, a, b, alog, bias, out, state, writes, keys, 
 
 
 def _flush_launch(k: _Kernel, h0, writes, keys, gates, rows, programs, slots, meta,
-                  widths, beta, u, phi, current_d, current_k, layout, rank_cap, query,
-                  output, output_scale, emit_output) -> None:  # fmt: skip
+                  widths, beta, u, phi, layout, rank_cap, query, output,
+                  output_scale, emit_output, finish=True) -> None:  # fmt: skip
     """The flush launch (``flush`` of the former C++ launcher)."""
     c = dict(k.spec.defines)
     warps, wmax = k.probes["warps"], int(c["WMAX"])
@@ -452,25 +475,42 @@ def _flush_launch(k: _Kernel, h0, writes, keys, gates, rows, programs, slots, me
            and h0.stride(3) == 1, "flush w1: dense (HV,128,128) state pages")  # fmt: skip
     _check(layout.dtype == torch.int32 and layout.is_contiguous() and layout.numel() == 4 * HV,
            "flush w1: int32 [HV,4] layout required")  # fmt: skip
-    _check(writes.shape[2] == wmax and keys.shape[2] == wmax and gates.shape[2] == wmax
-           and beta.shape[-1] == wmax, f"flush w1: compiled for window {wmax}")  # fmt: skip
+    _check(writes.shape[2] == 2 * wmax and keys.shape[2] == 3 * wmax
+           and gates.shape[2] == wmax and beta.shape[-1] == wmax,
+           f"flush w1: compiled for window {wmax}")  # fmt: skip
+    _check(writes.stride(1) == 2 * wmax * SV and writes.stride(2) == SV and writes.stride(3) == 1
+           and keys.stride(1) == 3 * wmax * SK and keys.stride(2) == SK and keys.stride(3) == 1,
+           "flush w1: dense per-slot d and k rings required")  # fmt: skip
     _check(all(t.dtype == torch.int32 and t.is_contiguous() for t in (rows, slots, meta)),
            "flush w1: contiguous int32 rows, slots and meta")  # fmt: skip
     if n_rows == 0 or programs <= 0:
         return
     fn = k.function("gdn_flush_warp_kernel", _FLUSH_SIG)
+    # One statistics record per work unit (flush row and value part): at most
+    # max(rows, CTAs per key head) units.
+    stats = torch.empty(max(n_rows, programs), HV, _FINISH_STATS, dtype=torch.float32,
+                        device=h0.device)  # fmt: skip
     args = (
-        h0.data_ptr(), writes.data_ptr(), current_d.data_ptr(), gates.data_ptr(),
+        h0.data_ptr(), writes.data_ptr(), keys.data_ptr(), gates.data_ptr(),
         rows.data_ptr(), n_rows, slots.data_ptr(), meta.data_ptr(), widths.data_ptr(),
-        u.data_ptr(), phi.data_ptr(), layout.data_ptr(), phi.stride(0), keys.data_ptr(),
-        current_k.data_ptr(), beta.data_ptr(), h0.stride(0), h0.stride(1),
-        writes.stride(0), gates.stride(0), u.stride(0), keys.stride(0), beta.stride(0),
+        u.data_ptr(), layout.data_ptr(), stats.data_ptr(), beta.data_ptr(),
+        h0.stride(0), h0.stride(1), writes.stride(0), keys.stride(0), gates.stride(0),
+        u.stride(0), beta.stride(0),
         H, HV, G, query.data_ptr(), output.data_ptr(), query.stride(0),
         query.dtype == torch.bfloat16, output.dtype == torch.bfloat16, output_scale,
         emit_output,
     )  # fmt: skip
-    drv.launch(fn, _FLUSH_SIG, (programs, H, 1), (k.probes["threads"], 1, 1),
-               k.probes["smem"], drv.current_stream(h0.device.index), args)  # fmt: skip
+    stream = drv.current_stream(h0.device.index)
+    drv.launch(fn, _FLUSH_SIG, (H, programs, 1), (k.probes["threads"], 1, 1),
+               k.probes["smem"], stream, args)  # fmt: skip
+    if not finish:                                  # no sketch heads of rank 0 < m < K
+        return
+    # The coefficient finish of the rebuilt sketches: one warp per (row, head).
+    fin = k.function("gdn_finish_kernel", _FINISH_SIG)
+    args = (stats.data_ptr(), rows.data_ptr(), n_rows, meta.data_ptr(), widths.data_ptr(),
+            layout.data_ptr(), phi.data_ptr(), phi.stride(0), HV, programs)  # fmt: skip
+    drv.launch(fin, _FINISH_SIG, (min(n_rows, _FINISH_PROGRAMS), -(-HV // 8), 1), (256, 1, 1), 0,
+               stream, args)  # fmt: skip
 
 
 def gdn_decode(
@@ -492,6 +532,8 @@ def gdn_decode(
     scale: float,
     null_block_id: int = 0,
     has_flush_rows: bool = True,
+    *,
+    qk: torch.Tensor | None = None,
 ) -> None:
     """One SketchSSM decode step of a GDN layer.
 
@@ -499,26 +541,42 @@ def gdn_decode(
     rows (``write_pos == W - 1``) fold the window into the full state,
     rebuild their sketch and overwrite their output with the exact one.
 
+    The state is kept in the layer's rotated key frame R (per key head). q and
+    k arrive unrotated: the key ring holds the BF16 keys as they are and ring
+    dots use them unrotated; the sketch and state reads take ``qk``, the FP32
+    rotated R q and R k ``(batch, 2, H, K)`` (None without a frame, as for
+    ReplaySSM). The flush folds the window as the reference recurrence does in
+    FP32: from the BF16 d ring rows, their residuals and the unit keys that
+    the steps write (flush-only rows of the rings), it solves the window's WY
+    system for the exact updates.
+
     Args:
-        mixed_qkv: ``(batch, 2 H K + HV V)`` with q/k already rotated.
+        mixed_qkv: ``(batch, 2 H K + HV V)``, q/k unrotated.
         a, b: ``(batch, HV)`` gate activations; ``A_log``, ``dt_bias``: ``(HV,)``.
         out: ``(batch, HV, V)`` contiguous output, dtype of ``mixed_qkv``.
         state: ``(slots, HV, V, K)`` FP32 state in rotated key coordinates.
-        d_cache, k_cache, g_cache: window rings ``(slots, HV, W, V)``,
-            ``(slots, H, W, K)`` (BF16) and ``(slots, HV, W)`` (FP32); the
-            window ``W`` is a multiple of 16.
+        d_cache, k_cache, g_cache: window rings ``(slots, HV, 2 W, V)``,
+            ``(slots, H, 3 W, K)`` (BF16 storage) and ``(slots, HV, W)``
+            (FP32); the window ``W`` is a multiple of 16. d: W BF16 rows d,
+            then W fp16 rows of d - bf16(d) in units of its bf16 ulp; k: W - 1
+            BF16 rows of the raw keys (row W - 1 unused), then W fp16 rows each
+            of hi and lo of 2^10 x the unit keys in the rotated frame. The
+            fp16 rows are for the flush only.
         slots: ``(batch,)`` int32 state slots; ``null_block_id`` (0) marks
             padding.
         write_pos: ``(batch,)`` int32 ring positions in ``[0, W - 1]``.
         meta: ``(batch,)`` int32 sketch rows (persistent request indices).
-        flush_rows: ``(batch,)`` int32 flush rows, then -1 padding.
+        flush_rows: ``(batch,)`` int32 flush rows, then padding: ``-2 - n``
+            with n the number of flush rows lets the flush split the values of
+            few flush rows over its CTAs (lower latency); -1 (count unknown)
+            folds each row in one CTA.
         has_flush_rows: False skips the flush launch (no row flushes).
     """
     batch = mixed_qkv.shape[0]
     if batch == 0:
         return
     t = sketch.tables
-    h, hv, w = k_cache.shape[1], state.shape[1], k_cache.shape[2]
+    h, hv, w = k_cache.shape[1], state.shape[1], g_cache.shape[2]
     assert w == sketch.tables.window
     if slots.dim() == 2:
         slots = slots[:, 0]
@@ -535,17 +593,17 @@ def gdn_decode(
     _step_launch(
         step, mixed_qkv, a, b, A_log, dt_bias, step_out, state, d_cache, k_cache,
         g_cache, slots, write_pos, sketch.u, sketch.phi, t.ranks, sketch.fs,
-        meta, sketch.beta, sketch.current_d, sketch.current_k, t.layout,
-        t.rank_cap, scale,
+        meta, sketch.beta, qk, t.layout, t.rank_cap, scale,
     )  # fmt: skip
     if not has_flush_rows:
         return
     assert flush_rows.is_contiguous() and flush_rows.dtype == torch.int32
+    query = mixed_qkv if qk is None else qk.view(batch, 2 * h * HEAD_DIM)
     _flush_launch(
         _flush_ext(h, hv, w), state, d_cache, k_cache, g_cache, flush_rows,
-        flush_programs(batch, h, hv, w), slots, meta, t.ranks, sketch.beta, sketch.u,
-        sketch.phi, sketch.current_d, sketch.current_k, t.layout, t.rank_cap,
-        mixed_qkv, step_out, scale, True,
+        flush_programs(batch, h, hv, w), slots, meta, t.ranks,
+        sketch.beta, sketch.u, sketch.phi, t.layout, t.rank_cap, query, step_out,
+        scale, True, getattr(t, "has_sketch_heads", True),
     )  # fmt: skip
 
 

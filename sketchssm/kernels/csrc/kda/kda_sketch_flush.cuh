@@ -8,6 +8,11 @@
 #include <cuda_bf16.h>
 #include <ATen/cuda/CUDAContext.h>
 
+// Ridge of the coefficient solve (coefficients in the orthonormal sketch basis).
+#ifndef SK_RIDGE
+#define SK_RIDGE .003f
+#endif
+
 
 #define FULL 0xffffffffu
 #define KPB 136                 // bf16 row pitch of the key-indexed tables (sA, sC, sO): keys contiguous, conflict-free ldmatrix rows
@@ -1056,12 +1061,12 @@ kda_flush_finish(
         float res = (gg < m) ? sc[1024 + gg] / safe - (z[0] * z[0] + z[1] * z[1] + z[2] * z[2] + z[3] * z[3]) : 0.f;
         res = fmaxf(res, 0.f);
         if (gg < np) res = 0.f;
-        const float den = res + 0.1f;
+        const float den = res + SK_RIDGE;
         const float inv_den = __frcp_rn(den);
         float b[4];
         #pragma unroll
         for (int j = 0; j < 4; ++j) { b[j] = (gg < m) ? z[j] * inv_den : 0.f; sTab[warp][j][gg] = z[j]; sGm[warp][j][gg] = b[j]; }
-        sTab[warp][4][gg] = (gg < m) ? (0.1f * inv_den - 1.f) : 0.f;
+        sTab[warp][4][gg] = (gg < m) ? (SK_RIDGE * inv_den - 1.f) : 0.f;
         sTab[warp][5][gg] = res * inv_den;
         #pragma unroll
         for (int j = 0; j < 4; ++j)

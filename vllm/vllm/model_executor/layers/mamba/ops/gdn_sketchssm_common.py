@@ -1,15 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SketchSSM storage, q/k rotation and cold sketch build for Gated DeltaNet.
+"""SketchSSM storage, q/k and state rotation and cold sketch build for Gated
+DeltaNet.
 
-The state ``(slot, HV, V, K)`` is kept in rotated key coordinates. Per
-request, a value head of rank ``m`` (0 = dense) keeps packed BF16 rows ``u``
-(leading key columns), ``phi`` (coefficient map) and ``fs`` (projected erase
-history). Dense heads keep all ``K`` key columns in ``u``: non-flush steps
-read them instead of the FP32 state, which changes only at flushes. Their
-layout ``u_off`` is -1 when they have no rows (ReplaySSM: every head dense,
-the FP32 state read at every step). Sketch buffers are indexed by the
-persistent request index.
+The state ``(slot, HV, V, K)`` is kept in rotated key coordinates (``S R^T``
+for the calibrated frame R of the key head). Per request, a value head of
+rank ``m`` (0 = dense) keeps packed BF16 rows ``u`` (leading key columns),
+``phi`` (coefficient map) and ``fs`` (projected erase history). Dense heads
+keep all ``K`` key columns in ``u``: non-flush steps read them instead of the
+FP32 state, which changes only at flushes. Their layout ``u_off`` is -1 when
+they have no rows (ReplaySSM: every head dense, the FP32 state read at every
+step). Sketch buffers are indexed by the persistent request index.
+
+q and k stay unrotated in the activations: decode takes their FP32 rotation
+(``gdn_sketch_qk``) where they meet the rotated state or sketch, and the key
+ring holds the BF16 keys as they are. For the flush, the steps also write the
+residual of their BF16 d ring rows and the unit keys in the rotated frame
+(extra fp16 rows of the slot's d and k rings), from which it folds the window
+exactly. Prefill runs in the
+unrotated frame on an unrotated copy of the state (``gdn_state_rotate``).
 """
 
 from dataclasses import dataclass
@@ -83,6 +92,8 @@ class GDNSketchTables(torch.nn.Module):
         self.window = window
         self.num_v_heads = ranks.numel()
         self.rank_cap = gdn_rank_cap(ranks)
+        # Heads with a coefficient map to rebuild at flushes (0 < m < K).
+        self.has_sketch_heads = bool(((ranks > 0) & (ranks < GDN_SKETCH_HEAD_DIM)).any())
         device = torch.get_default_device()
         self.register_buffer("ranks", ranks.to(device), persistent=False)
         self.register_buffer("layout", layout.to(device), persistent=False)
@@ -97,8 +108,6 @@ class GDNSketchTables(torch.nn.Module):
             "phi": ((nm,), torch.bfloat16),
             "fs": ((nf,), torch.bfloat16),
             "beta": ((hv, w), torch.float32),
-            "current_d": ((hv, d), torch.float32),
-            "current_k": ((h, d), torch.float32),
         }
 
 
@@ -110,8 +119,6 @@ class GDNSketchArgs:
     phi: torch.Tensor
     fs: torch.Tensor
     beta: torch.Tensor
-    current_d: torch.Tensor
-    current_k: torch.Tensor
     tables: GDNSketchTables
 
     @classmethod
@@ -126,19 +133,23 @@ class GDNSketchArgs:
 
 
 @triton.jit(do_not_specialize=["T"])
-def _rotate_qk_kernel(X, RT, T, s_t, HK: tl.constexpr, K: tl.constexpr,
-                      BT: tl.constexpr):  # fmt: skip
-    # In place, q then k of key head h: x <- R x.
+def _rotate_qk_kernel(X, RT, Y, T, s_x, s_y, HK: tl.constexpr, K: tl.constexpr,
+                      BT: tl.constexpr, BC: tl.constexpr):  # fmt: skip
+    # y[t, z, h, cols] <- (R x[t, z, h])[cols] in FP32 (z = 0: q, 1: k), x
+    # unrotated; BC output columns per program.
     pt = tl.program_id(0)
     h = tl.program_id(1)
     rows = pt * BT + tl.arange(0, BT)
-    cols = tl.arange(0, K)
-    rt = tl.load(RT + h * K * K + cols[:, None] * K + cols[None, :])
+    kk = tl.arange(0, K)
+    oc = tl.program_id(2) * BC + tl.arange(0, BC)
+    rt = tl.load(RT + h * K * K + kk[:, None] * K + oc[None, :])
+    mask = rows[:, None] < T
     for z in tl.static_range(2):
-        ptr = X + rows[:, None].to(tl.int64) * s_t + (z * HK + h) * K + cols[None, :]
-        x = tl.load(ptr, mask=rows[:, None] < T, other=0.0).to(tl.float32)
-        y = tl.dot(x, rt, input_precision="tf32x3")
-        tl.store(ptr, y.to(X.dtype.element_ty), mask=rows[:, None] < T)
+        src = X + rows[:, None].to(tl.int64) * s_x + (z * HK + h) * K + kk[None, :]
+        x = tl.load(src, mask=mask, other=0.0)
+        y = tl.dot(x.to(tl.float32), rt, input_precision="tf32x3")
+        dst = Y + rows[:, None].to(tl.int64) * s_y + (z * HK + h) * K + oc[None, :]
+        tl.store(dst, y, mask=mask)
 
 
 def gdn_rotation_from_frames(frames: torch.Tensor) -> torch.Tensor:
@@ -146,21 +157,63 @@ def gdn_rotation_from_frames(frames: torch.Tensor) -> torch.Tensor:
     return frames.to(torch.float32).transpose(-1, -2).contiguous()
 
 
-def gdn_sketch_rotate_(mixed_qkv: torch.Tensor, frames_t: torch.Tensor) -> None:
-    """Rotate q and k of ``mixed_qkv (tokens, 2 H K + HV V)`` in place.
+def gdn_sketch_qk(mixed_qkv: torch.Tensor, frames_t: torch.Tensor) -> torch.Tensor:
+    """FP32 rotated ``R q`` and ``R k`` ``(tokens, 2, H, K)`` of the unrotated
+    q and k of ``mixed_qkv (tokens, 2 H K + HV V)``.
 
     ``frames_t`` is ``gdn_rotation_from_frames(frames)``.
     """
     num_tokens = mixed_qkv.shape[0]
-    if num_tokens == 0:
-        return
     h, k, _ = frames_t.shape
+    out = torch.empty(num_tokens, 2, h, k, dtype=torch.float32, device=mixed_qkv.device)
+    if num_tokens == 0:
+        return out
     assert mixed_qkv.stride(1) == 1 and frames_t.is_contiguous()
     assert frames_t.dtype == torch.float32
-    bt = 64 if num_tokens >= 1024 else 32
-    _rotate_qk_kernel[(triton.cdiv(num_tokens, bt), h)](
-        mixed_qkv, frames_t, num_tokens, mixed_qkv.stride(0), HK=h, K=k, BT=bt,
-        num_warps=4,
+    bt = 16 if num_tokens <= 64 else 64
+    bc = 32
+    _rotate_qk_kernel[(triton.cdiv(num_tokens, bt), h, k // bc)](
+        mixed_qkv, frames_t, out, num_tokens, mixed_qkv.stride(0), out.stride(0),
+        HK=h, K=k, BT=bt, BC=bc, num_warps=4,
+    )  # fmt: skip
+    return out
+
+
+@triton.jit
+def _rotate_state_kernel(S, RT, s_row, s_head, s_v, HPG: tl.constexpr,
+                         K: tl.constexpr, BV: tl.constexpr,
+                         INVERSE: tl.constexpr):  # fmt: skip
+    # In place, one (row, value head, value block): S[v, :] <- S[v, :] R^T
+    # (INVERSE: S[v, :] R).
+    row = tl.program_id(0).to(tl.int64)
+    hv = tl.program_id(1)
+    vb = tl.program_id(2) * BV + tl.arange(0, BV)
+    cols = tl.arange(0, K)
+    h = hv // HPG
+    if INVERSE:
+        rt = tl.load(RT + h * K * K + cols[None, :] * K + cols[:, None])
+    else:
+        rt = tl.load(RT + h * K * K + cols[:, None] * K + cols[None, :])
+    ptr = S + row * s_row + hv * s_head + vb[:, None] * s_v + cols[None, :]
+    x = tl.load(ptr)
+    tl.store(ptr, tl.dot(x, rt, input_precision="tf32x3"))
+
+
+def gdn_state_rotate(state: torch.Tensor, frames_t: torch.Tensor,
+                     inverse: bool = False) -> None:  # fmt: skip
+    """Rotate FP32 states ``(rows, HV, V, K)`` in place into the key frame,
+    ``S R^T`` (``inverse``: back, ``S R``), in FP32."""
+    rows, hv, v, k = state.shape
+    h = frames_t.shape[0]
+    if rows == 0:
+        return
+    assert state.dtype == torch.float32 and state.stride(3) == 1
+    assert frames_t.is_contiguous() and frames_t.shape == (h, k, k)
+    assert hv % h == 0
+    bv = 32
+    _rotate_state_kernel[(rows, hv, triton.cdiv(v, bv))](
+        state, frames_t, state.stride(0), state.stride(1), state.stride(2),
+        HPG=hv // h, K=k, BV=bv, INVERSE=inverse, num_warps=4,
     )  # fmt: skip
 
 
@@ -254,7 +307,7 @@ def _build_head(base, sk, h, u, packed, fs, beta, widths, layout, SU: tl.constex
                 energy / safe_mean - z0 * z0 - z1 * z1 - z2 * z2 - z3 * z3, 0.0
             )
             residual = tl.where(j < tl.minimum(m, 4), 0.0, residual)
-            denominator = residual + 0.1
+            denominator = residual + 0.003  # ridge
             a = residual / denominator
             b0 = tl.where(j < m, z0 / denominator, 0.0)
             b1 = tl.where(j < m, z1 / denominator, 0.0)
@@ -280,7 +333,7 @@ def _build_head(base, sk, h, u, packed, fs, beta, widths, layout, SU: tl.constex
             g2 = (y2 - l3_2 * g3) / l2_2
             g1 = (y1 - l2_1 * g2 - l3_1 * g3) / l1_1
             g0 = (y0 - l1_0 * g1 - l2_0 * g2 - l3_0 * g3) / l0_0
-            factor = tl.where(j < m, 0.1 / denominator, 1.0)
+            factor = tl.where(j < m, 0.003 / denominator, 1.0)
             tbase = packed + sk * SM + moff + j
             index = sk * SM + moff + 4 * K + j
             if m <= 4:

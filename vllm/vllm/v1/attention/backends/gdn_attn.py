@@ -526,8 +526,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
             is_flush_cpu = window_pos_cpu == self.sketchssm_window - 1
             sketch_has_flush_rows = bool(is_flush_cpu.any())
+            # The flush rows are padded with -2 - n (n flush rows): the GDN flush
+            # spreads few flush rows over more CTAs.
+            num_flush = int(is_flush_cpu.sum())
             sketch_meta_d, sketch_flush_rows_d = sketch_decode_rows(
-                m, num_decodes, is_flush_cpu
+                m, num_decodes, is_flush_cpu, pad=-2 - num_flush
             )
         if self.use_sketchssm and spec_sequence_masks is None and num_prefills > 0:
             sketch_meta_p, sketch_build_p = sketch_prefill_rows(
@@ -559,7 +562,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     sketch_flush_rows_d, non_blocking=True
                 )
                 sketch_flush_rows_d = self.decode_sketch_flush_rows_d[:batch_size]
-                sketch_flush_rows_d[num_decodes:] = -1
+                sketch_flush_rows_d[num_decodes:] = -2 - num_flush
             self.non_spec_state_indices_tensor[:num_decodes].copy_(
                 non_spec_state_indices_tensor, non_blocking=True
             )

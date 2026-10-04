@@ -44,7 +44,7 @@ def coefficient(state, frame, rank, pivots=4):
     res = (s.square().sum(0) - z.square().sum(0)).clamp_min(0)
     res[: min(rank, pivots)] = 0
     m = z.T @ z + torch.diag(res)
-    eye = 0.1 * torch.eye(rank, dtype=torch.float64)
+    eye = 0.003 * torch.eye(rank, dtype=torch.float64)
     return frame @ torch.linalg.solve(m[:rank, :rank] + eye, m[:rank]).T
 
 

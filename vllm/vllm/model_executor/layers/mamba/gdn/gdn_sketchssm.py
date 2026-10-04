@@ -6,6 +6,10 @@ Dense heads (rank 0) of a calibration keep BF16 rows of their full state,
 read on non-flush steps. ``--use-replayssm`` runs the same kernels with every
 head dense, without those rows (the FP32 state is read at every step) and no
 rotation: the exact window replay of ReplaySSM, without a calibration.
+
+q and k stay unrotated in the activations. Decode rotates them in FP32 where
+they meet the rotated state or sketch; prefill runs on the unrotated state
+(``unrotate_state`` before, ``rotate_state`` after).
 """
 
 from typing import TYPE_CHECKING
@@ -19,8 +23,9 @@ from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_common import (
     GDNSketchTables,
     gdn_rotation_from_frames,
     gdn_sketch_build,
-    gdn_sketch_rotate_,
+    gdn_sketch_qk,
     gdn_sketch_window_supported,
+    gdn_state_rotate,
 )
 from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_triton import (
     gdn_sketch_triton_decode,
@@ -94,10 +99,17 @@ class GDNSketchSSM(torch.nn.Module):
         )
         self.sketch = GDNSketchArgs.allocate(self.tables, max_num_reqs, device)
 
-    def rotate_(self, mixed_qkv: torch.Tensor) -> None:
-        """Rotate q and k of ``mixed_qkv (tokens, 2 H K + HV V)`` in place."""
+    def unrotate_state(self, state: torch.Tensor) -> None:
+        """Rotate FP32 states ``(rows, HV, V, K)`` back to the model's key
+        coordinates in place (before a prefill continues from them)."""
         if self.rotation_t is not None:
-            gdn_sketch_rotate_(mixed_qkv, self.rotation_t)
+            gdn_state_rotate(state, self.rotation_t, inverse=True)
+
+    def rotate_state(self, state: torch.Tensor) -> None:
+        """Rotate FP32 states ``(rows, HV, V, K)`` into the sketch's key frame
+        in place (after a prefill)."""
+        if self.rotation_t is not None:
+            gdn_state_rotate(state, self.rotation_t)
 
     def prefilled(
         self, state: torch.Tensor, attn_metadata, state_indices: torch.Tensor
@@ -124,12 +136,16 @@ class GDNSketchSSM(torch.nn.Module):
         state_indices: torch.Tensor,
         scale: float,
     ) -> None:
-        """One decode step; rows at the end of their window are flushed."""
+        """One decode step (q/k of ``mixed_qkv`` unrotated); rows at the end
+        of their window are flushed."""
+        qk = None
+        if self.rotation_t is not None:
+            qk = gdn_sketch_qk(mixed_qkv, self.rotation_t)
         self._decode(
             mixed_qkv, a, b, A_log, dt_bias, out, state, d_cache, k_cache,
             g_cache, state_indices, attn_metadata.sketchssm_window_pos_d,
             attn_metadata.sketch_meta_d, attn_metadata.sketch_flush_rows_d,
-            self.sketch, scale,
+            self.sketch, scale, qk=qk,
         )  # fmt: skip
 
     @classmethod

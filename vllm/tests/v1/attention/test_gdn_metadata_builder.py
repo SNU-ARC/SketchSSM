@@ -251,6 +251,7 @@ def test_sketchssm_window_pos_and_prompt_tail(gdn_replayssm: bool):
     assert (meta.num_decodes, meta.num_prefills) == (2, 1)
     assert meta.sketchssm_window_pos_d.tolist() == [5, 0]
     assert meta.sketch_meta_d.tolist() == [4, 1]
-    assert meta.sketch_flush_rows_d.tolist() == [-1, -1]
+    # no flush rows: padding -2 - 0 carries the flush count (0)
+    assert meta.sketch_flush_rows_d.tolist() == [-2, -2]
     assert not meta.sketch_has_flush_rows
     assert meta.sketch_meta_p.tolist() == [6]

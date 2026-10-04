@@ -384,14 +384,16 @@ class MambaStateShapeCalculator:
         head_v_dim: int,
         ring_len: int,
     ) -> tuple[tuple[int, ...], ...]:
-        """Append the shapes of the GDN SketchSSM rings: ``d (HV, L, V)``,
-        ``k (H, L, K)`` and ``g (HV, L)``."""
+        """Append the shapes of the GDN SketchSSM rings: ``d (HV, 2 L, V)``
+        (L BF16 rows, then L fp16 rows of their residual for the flush),
+        ``k (H, 3 L, K)`` (L raw BF16 keys, then L fp16 rows each of the hi and
+        lo of the scaled unit keys for the flush) and ``g (HV, L)``."""
         local_v_heads = divide(num_v_heads, tp_world_size)
         local_k_heads = divide(num_k_heads, tp_world_size)
         return (
             *base_shapes,
-            (local_v_heads, ring_len, head_v_dim),
-            (local_k_heads, ring_len, head_k_dim),
+            (local_v_heads, 2 * ring_len, head_v_dim),
+            (local_k_heads, 3 * ring_len, head_k_dim),
             (local_v_heads, ring_len),
         )
 
