@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SketchSSM Mamba-2 decode (CUDA and Triton kernels) against FP64 references."""
+"""SketchSSM Mamba-2 decode (CUDA and Triton kernels) against FP64 references.
+
+The state lives in random per-group frames; B and C arrive unrotated and the
+references rotate them in FP64.
+"""
 
 import pytest
 import torch
@@ -74,7 +78,11 @@ class Layer:
         ranks = torch.tensor(RANKS, dtype=torch.int32)
         shapes = zip(sk.sketch_shapes(ranks, P, N), sk.SKETCH_DTYPES)
         u, w, ag = (torch.zeros(batch, *s, dtype=d).cuda() for s, d in shapes)
-        self.sketch = sk.SketchArgs(u, w, ag, sk.SketchTables(ranks, N).cuda())
+        frames = torch.linalg.qr(torch.randn(G, N, N, generator=g))[0]
+        frames_t = frames.transpose(-1, -2).contiguous().cuda()
+        self.rot = frames_t.double()  # row vectors rotate as v @ frames_t
+        tables = sk.SketchTables(ranks, N).cuda()
+        self.sketch = sk.SketchArgs(u, w, ag, tables, frames_t)
         # x, B and C are slices of one row buffer, as in the model.
         self.conv = torch.empty(batch, H * P + 2 * G * N, dtype=bf16).cuda()
         self.out = torch.empty(batch, H, P, dtype=bf16).cuda()
@@ -115,7 +123,9 @@ class Layer:
             w, decay = dts * torch.exp(a * (cs[:, -1:] - cs)), torch.exp(a * cs[:, -1:])
             xs = torch.cat([self.x_cache[slot, :, :p], x[row, :, None]], 1).double()
             ks = torch.cat([self.B_cache[slot, :, :p], B[row, :, None]], 1).double()
-            ks, q = ks.repeat_interleave(r, 0), C[row].double().repeat_interleave(r, 0)
+            ks = torch.einsum("gtn,gnk->gtk", ks, self.rot)
+            q = (C[row].double()[:, None] @ self.rot)[:, 0]
+            ks, q = ks.repeat_interleave(r, 0), q.repeat_interleave(r, 0)
             skip = self.D.double()[:, None] * xs[:, -1]
             if p == self.W - 1:
                 s = decay[..., None] * s0[slot]

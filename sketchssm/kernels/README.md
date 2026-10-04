@@ -62,7 +62,7 @@ was built with, so install `sketchssm` alongside it.
 ```python
 from sketchssm import kernels as sk
 
-sk.API_VERSION                     # 2; bumped on a breaking change
+sk.API_VERSION                     # 3; bumped on a breaking change
 sk.set_config_dirs([folder, ...])  # extra tuned-config folders
 sk.set_aot_dirs([folder, ...])     # extra precompiled-kernel folders
 sk.set_cache_dir(path)             # where the NVRTC builds go
@@ -72,8 +72,8 @@ sk.mamba2_supported(num_heads, head_dim, state_size, n_groups, window,
                     activation_dtype, state_dtype) -> Support
 sk.mamba2_decode(state, x, dt, A, B, C, D, dt_bias, x_cache, dt_cache, B_cache,
                  bc_pre, write_pos, is_flush, flush_rows, slots, meta, out, sketch,
-                 null_block_id=0, has_flush_rows=True, *, flush_programs,
-                 run_with_flush=None)
+                 null_block_id=0, has_flush_rows=True, *, frames_t,
+                 flush_programs, run_with_flush=None)
 # GDN
 sk.gdn_supported(num_k_heads, num_v_heads, head_k_dim, head_v_dim, window,
                  activation_dtype, state_dtype) -> Support
@@ -103,7 +103,7 @@ sk.kda_cold_build(state, rings, slots, meta, rows, sketch, scratch,
 
 **The window.** `W` is read from the ring shapes. It can be any multiple of 16.
 
-**Mamba-2 `bc_pre`.** The Mamba-2 decode expects `bc_pre`, the ring's B·C products, to be filled by the caller. In vLLM this is the Triton `sketch_bc_pre`. `run_with_flush(flush, nonflush)` lets the caller overlap the two launches. vLLM runs the flush on a side stream.
+**Mamba-2 frames.** The Mamba-2 state is kept in a rotated frame R per group (`frames_t` = Rᵀ, `(groups, N, N)` FP32), but B and C stay unrotated where precision matters: the B ring holds the BF16 B (as ReplaySSM does) and `bc_pre`, the ring's B·C products, comes from the unrotated B and C. The caller fills `bc_pre` and passes the FP32 query R·C as `C` (in vLLM, the Triton `sketch_bc_pre` and `sketch_query`). The flush kernel rotates the window keys R·B_t itself to FP32 accuracy (BF16 keys times the frame split into three BF16 terms on tensor cores), once per CTA for the `WARPS` heads of a group it serves. `run_with_flush(flush, nonflush)` lets the caller overlap the two launches. vLLM runs the flush on a side stream.
 
 ## Supported shapes
 

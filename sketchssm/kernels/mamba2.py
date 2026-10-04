@@ -11,6 +11,7 @@ Specializations come precompiled when available, else from NVRTC.
 
 import functools
 import logging
+import math
 from collections.abc import Callable
 
 import torch
@@ -56,6 +57,17 @@ def default_configs(target: Target | None = None) -> tuple[dict, dict]:
     return dict(_NF_CONFIG), dict(_FLUSH_CONFIG, **_SM90_FLUSH_OVERRIDES)
 
 
+def _shape_flush_defaults(flush: dict, heads_per_group: int, state_size: int) -> dict:
+    """The flush defaults of a layer shape: CTAs of up to eight heads of one
+    group, which rotate their window keys once, with the frame fragments in
+    shared memory for state sizes up to 128."""
+    warps = math.gcd(8, heads_per_group)
+    if warps > 1:
+        flush.update(WARPS=warps, MINB=max(1, 8 // warps),
+                     FL_FRAG_SMEM=int(state_size <= 128 and warps >= 4))
+    return flush
+
+
 def config_file_name(
     head_dim: int,
     heads_per_group: int,
@@ -94,6 +106,36 @@ def window16_fallback(
     )
 
 
+def _tuned_path(head_dim, heads_per_group, state_size, window, target=None):
+    path = _config_file(head_dim, heads_per_group, state_size, window, target)
+    if path is None and window16_fallback(
+        head_dim, heads_per_group, state_size, window, target
+    ):
+        path = _config_file(head_dim, heads_per_group, state_size, 16, target)
+    return path
+
+
+@functools.cache
+def large_batch_config(
+    head_dim: int,
+    heads_per_group: int,
+    state_size: int = 128,
+    window: int = 16,
+    target: Target | None = None,
+) -> tuple[int, dict] | None:
+    """``(min_rows, flush knobs)`` of the flush of steps with at least
+    ``min_rows`` flush rows, from the ``"flush_large"`` overrides (applied on
+    top of ``"flush"``) and ``"flush_large_min_batch"`` of the tuned file, if
+    any. Wide CTAs that rotate the window keys once for many heads pay off
+    when many rows flush; with few, their heads run one after the other."""
+    path = _tuned_path(head_dim, heads_per_group, state_size, window, target)
+    raw = rt.read_config(path) if path is not None else {}
+    if "flush_large" not in raw:
+        return None
+    flush = tuned_config(head_dim, heads_per_group, state_size, window, target)[1]
+    return int(raw["flush_large_min_batch"]), dict(flush, **raw["flush_large"])
+
+
 @functools.cache
 def tuned_config(
     head_dim: int,
@@ -105,7 +147,8 @@ def tuned_config(
     """Non-flush and flush build knobs for a layer shape on this GPU (or
     ``target``).
 
-    The defaults are ``default_configs()`` of the architecture. A JSON file
+    The defaults are ``default_configs()`` of the architecture, with the flush
+    CTA width adapted to the shape (``_shape_flush_defaults``). A JSON file
     ``{"nf": {...}, "flush": {...}}`` named by ``config_file_name`` in a
     config folder (``_runtime.config_folders``) overrides them. The lookup
     takes the file of the layer shape and window, then that of the shape at
@@ -113,11 +156,8 @@ def tuned_config(
     window, the build falls back to the defaults), then the defaults.
     """
     nf, flush = default_configs(target)
-    path = _config_file(head_dim, heads_per_group, state_size, window, target)
-    if path is None and window16_fallback(
-        head_dim, heads_per_group, state_size, window, target
-    ):
-        path = _config_file(head_dim, heads_per_group, state_size, 16, target)
+    flush = _shape_flush_defaults(flush, heads_per_group, state_size)
+    path = _tuned_path(head_dim, heads_per_group, state_size, window, target)
     if path is not None:
         raw = rt.read_config(path)
         rt.log_once(
@@ -145,8 +185,9 @@ _NF_PROBES = (
 )
 _FLUSH_PROBES = (
     ("strides_bytes", "sizeof(FlushStrides)"),
-    ("dyn_smem", "FL_WSMEM ? sizeof(WarpShared) * WARPS : 0"),
+    ("dyn_smem", "FL_DYN_SMEM"),
     ("warps", "WARPS"),
+    ("hpw", "FL_HPW"),
     ("uw_bf16", "UW_BF16"),
     ("stages", "FL_STAGES"),
     ("csmem", "FL_CSMEM"),
@@ -261,8 +302,11 @@ def mamba2_supported(
     if hpg % nf["NF_HEADS"]:
         return Support(False, "heads per group not a multiple of NF_HEADS")
     shape = _shape(num_heads, hpg, head_dim, state_size, window)
-    flush_spec = make_spec("mamba2_sketch_flush", dict(flush, **shape))
-    support = rt.kernel_support([flush_spec])
+    specs = [make_spec("mamba2_sketch_flush", dict(flush, **shape))]
+    large = large_batch_config(head_dim, hpg, state_size, window)
+    if large is not None:
+        specs.append(make_spec("mamba2_sketch_flush", dict(large[1], **shape)))
+    support = rt.kernel_support(specs)
     if not support:
         return support
     # The non-flush kernel bakes in the cache strides, known only at run time:
@@ -300,12 +344,13 @@ def _build(name: str, config: dict, fns: list[str]) -> _Built:
     return _Built(name, config, kn.load(make_spec(name, config)))
 
 
-def _build_fitting(name: str, kind: int, d: dict, extra: dict, threads, fns):
+def _build_fitting(name: str, kind: int, d: dict, extra: dict, threads, fns,
+                   knobs: dict | None = None):
     """Build ``name`` with the tuned knobs of its shape and check that it fits
     this GPU (the flush kernel raises when its shared memory exceeds the
     limit; ``threads(knobs)`` threads must fit its registers). Knobs taken
-    from the window-16 file that do not build or fit at this window give way
-    to the architecture defaults."""
+    from the window-16 file, or the shape defaults when there is no file,
+    that do not build or fit give way to the architecture defaults."""
 
     def build(knobs: dict):
         ext = _build(name, dict(knobs, **extra, **d), fns)
@@ -317,25 +362,26 @@ def _build_fitting(name: str, kind: int, d: dict, extra: dict, threads, fns):
             )
         return ext
 
-    knobs = tuned_config(*_shape_key(d))[kind]
-    if not window16_fallback(*_shape_key(d)):
+    knobs = knobs if knobs is not None else tuned_config(*_shape_key(d))[kind]
+    if not window16_fallback(*_shape_key(d)) and _tuned_path(*_shape_key(d)) is not None:
         return build(knobs)
     try:
         return build(knobs)
     except Exception as e:
         rt.logger.warning(
-            "SketchSSM CUDA %s: the window-16 knobs %s do not build or fit at "
-            "window %d (%s); using the architecture defaults.",
+            "SketchSSM CUDA %s: the knobs %s do not build or fit at window %d "
+            "(%s); using the architecture defaults.",
             name, knobs, d["SK_W"], str(e).splitlines()[-1] if str(e) else e,
         )  # fmt: skip
         return build(default_configs()[kind])
 
 
 @functools.cache
-def _flush_ext(shape: tuple) -> _Built:
+def _flush_ext(shape: tuple, large: bool = False) -> _Built:
+    knobs = large_batch_config(*_shape_key(dict(shape)))[1] if large else None
     return _build_fitting(
         "mamba2_sketch_flush", 1, dict(shape), {},
-        lambda knobs: 32 * knobs["WARPS"], ["flush", "resources"],
+        lambda knobs: 32 * knobs["WARPS"], ["flush", "resources"], knobs,
     )  # fmt: skip
 
 
@@ -368,7 +414,7 @@ def _stride_init(strides: tuple[int, ...]) -> str:
 
 
 _NF_SIG = drv.Signature(["Q"] * 15 + ["i"] + ["Q"] * 10 + ["30q", "i", "i"])
-_FLUSH_SIG = drv.Signature(["Q"] * 23 + ["34q"] + ["i"] * 6 + ["Q", "i"])
+_FLUSH_SIG = drv.Signature(["Q"] * 23 + ["34q"] + ["i"] * 6 + ["Q", "i", "Q", "i", "i"])
 _BF16 = torch.bfloat16
 _F32 = torch.float32
 
@@ -393,13 +439,13 @@ def _nf_launch(k: _Built, state, x, dt, dt_bias, A, B, C, D, out, x_cache, dt_ca
     _check(x_cache.shape[2] == W and dt_cache.shape[2] == W and B_cache.shape[2] == W
            and bc_pre.shape[2] >= W,
            f"window rings must hold the {W} steps the kernel was built for")  # fmt: skip
-    _check(x.dtype == _BF16 and dt.dtype == _BF16 and B.dtype == _BF16 and C.dtype == _BF16,
-           "bf16 activations")  # fmt: skip
+    _check(x.dtype == _BF16 and dt.dtype == _BF16 and B.dtype == _BF16 and C.dtype == _F32,
+           "bf16 x/dt/B, fp32 query C")  # fmt: skip
     _check(dt_bias.dtype == _BF16 and D.dtype == _BF16 and A.dtype == _F32, "bf16 bias/D, fp32 A")
     _check(x_cache.dtype == _BF16 and B_cache.dtype == _BF16 and dt_cache.dtype == _F32
            and bc_pre.dtype == _F32, "ring dtypes")  # fmt: skip
     _check(out.dtype in (_BF16, _F32), "out dtype")
-    _check(query.dtype == _BF16 and query.stride(2) == 1
+    _check(query.dtype == _F32 and query.stride(2) == 1
            and query.shape[1] == c["SK_NHEADS"] // c["SK_HPG"]
            and query.shape[2] == c["SK_N"], "query")  # fmt: skip
     _check(x.stride(2) == 1 and out.stride(2) == 1 and x_cache.stride(3) == 1
@@ -420,8 +466,9 @@ def _nf_launch(k: _Built, state, x, dt, dt_bias, A, B, C, D, out, x_cache, dt_ca
            "16-byte alignment")  # fmt: skip
     _check(all(s % 8 == 0 for s in (x.stride(0), x.stride(1), x_cache.stride(0),
                x_cache.stride(1), x_cache.stride(2), B_cache.stride(0), B_cache.stride(1),
-               B_cache.stride(2), B.stride(0), B.stride(1), C.stride(0), C.stride(1),
-               query.stride(0), query.stride(1)))
+               B_cache.stride(2), B.stride(0), B.stride(1)))
+           and all(s % 4 == 0 for s in (C.stride(0), C.stride(1), query.stride(0),
+                                        query.stride(1)))
            and out.stride(0) % 4 == 0 and out.stride(1) % 4 == 0, "vector strides")  # fmt: skip
     st = (*strides, w.shape[1], u.shape[1], ag.shape[2])
     heads = k.probes["heads"]
@@ -445,11 +492,18 @@ def _nf_launch(k: _Built, state, x, dt, dt_bias, A, B, C, D, out, x_cache, dt_ca
 
 def _flush_launch(k: _Built, S, X, DT, Bias, A, B, C, D, O, XR, DR, BR, WP, FL, Slots,
                   Width, Map, Sketch, SkOff, Tail, AG, Offsets, WOff, strides, null_slot,
-                  skrows, sm, wrows, Rows, grid_rows) -> None:  # fmt: skip
+                  skrows, sm, wrows, Rows, grid_rows, frames,
+                  row_range=(0, 1 << 30)) -> None:  # fmt: skip
     """The flush launch (``flush`` of the former C++ launcher)."""
     c, p = k.config, k.probes
     W = c["SK_W"]
     _check(len(strides) == 34, "stride vector")
+    _check(B.dtype == _BF16 and C.dtype == _F32, "bf16 B, fp32 query C")
+    n, groups = c["SK_N"], c["SK_NHEADS"] // c["SK_HPG"]
+    _check(frames.dtype == _F32 and frames.is_contiguous()
+           and tuple(frames.shape) == (groups, n, n), "fp32 frames_t (groups, N, N)")  # fmt: skip
+    _check(C.stride(-1) == 1 and C.stride(0) % 4 == 0 and C.stride(1) % 4 == 0 and _al16(C),
+           "contiguous 16-byte aligned query rows")  # fmt: skip
     _check(S.shape[1] == c["SK_NHEADS"] and S.shape[2] == c["SK_P"] and S.shape[3] == c["SK_N"],
            "layer shape")  # fmt: skip
     _check(XR.shape[2] == W and DR.shape[2] == W and BR.shape[2] == W,
@@ -460,17 +514,17 @@ def _flush_launch(k: _Built, S, X, DT, Bias, A, B, C, D, O, XR, DR, BR, WP, FL, 
     elif p["stages"]:
         _check(strides[3] == c["SK_P"] and strides[2] == 1,
                "staged flush needs key-major state blocks")  # fmt: skip
-    if p["stages"] and p["csmem"]:
-        _check(C.stride(-1) == 1 and C.shape[-1] % 8 == 0, "C row staging needs a contiguous C row")
     if not p["dense"]:
         uw = _BF16 if p["uw_bf16"] else _F32
         _check(Sketch.dtype == uw and Tail.dtype == uw, "U/W storage dtype must match UW_BF16")
     rows = X.shape[0]
     warps = p["warps"]
-    heads = c["SK_NHEADS"] // warps
+    heads = c["SK_NHEADS"] // (warps * p["hpw"])
+    _check(p["row_list"] or tuple(row_range) == (0, 1 << 30), "a flush row range needs FL_ROW_LIST")
     if p["row_list"]:
         _check(Rows.numel() >= rows and Rows.dtype == torch.int32, "flush row list")
-        grid = (max(1, min(grid_rows, rows)), heads, 1)
+        # A CTA serves hpw heads per warp: proportionally fewer rows each.
+        grid = (max(1, min(grid_rows * p["hpw"], rows)), heads, 1)
     elif p["grid_hf"]:
         grid = (heads, rows, 1)
     else:
@@ -483,12 +537,18 @@ def _flush_launch(k: _Built, S, X, DT, Bias, A, B, C, D, O, XR, DR, BR, WP, FL, 
         Width.data_ptr(), Map.data_ptr(), Sketch.data_ptr(), SkOff.data_ptr(),
         Tail.data_ptr(), AG.data_ptr(), Offsets.data_ptr(), WOff.data_ptr(), *strides,
         null_slot, 1, int(O.dtype == _F32), skrows, sm, wrows, Rows.data_ptr(), rows,
+        frames.data_ptr(), *row_range,
     )  # fmt: skip
     drv.launch(fn, _FLUSH_SIG, grid, (32 * warps, 1, 1), k._dyn_smem(),
                drv.current_stream(X.device.index), args)  # fmt: skip
 
 
 _DUMMY: dict[torch.device, torch.Tensor] = {}
+
+
+@functools.cache
+def _aux_stream(device: torch.device) -> torch.cuda.Stream:
+    return torch.cuda.Stream(device)
 
 
 def _run_with_flush(flush: Callable[[], None], nonflush: Callable[[], None]):
@@ -519,20 +579,28 @@ def mamba2_decode(
     null_block_id: int = 0,
     has_flush_rows: bool = True,
     *,
+    frames_t: torch.Tensor,
     flush_programs: int,
     run_with_flush: Callable[[Callable[[], None], Callable[[], None]], None]
     | None = None,
 ) -> None:
     """One SketchSSM decode step of a Mamba-2 layer, after the caller filled
-    ``bc_pre`` (the B·C products of the ring, ``(batch, groups, W)`` FP32).
+    ``bc_pre`` (the B·C products of the ring, ``(batch, groups, W)`` FP32,
+    from the unrotated B and C).
+
+    The state is kept in the layer's rotated frame R (per group), given as
+    ``frames_t`` = R^T ``(groups, N, N)`` FP32. ``B`` is the unrotated BF16
+    key, appended to the ring as is; ``C`` is the FP32 query R·C ``(batch,
+    groups, N)``. The flush rotates its window keys R·B_t itself, once per
+    group and CTA, to FP32 accuracy.
 
     Non-flush rows read their sketch; flush rows replay the window into the
     full state and rebuild the sketch. ``dt``, ``A``, ``D`` and ``dt_bias``
     are per head, expanded over dim/dstate; ``state`` is the
-    ``(slots, H, dim, dstate)`` view of the key-major state, B/C are already
-    rotated, ``meta`` holds each row's sketch index, and ``flush_rows`` lists
-    the flush rows followed by -1 padding, walked by ``flush_programs`` CTAs.
-    With ``has_flush_rows=False`` the flush launch is skipped.
+    ``(slots, H, dim, dstate)`` view of the key-major state, ``meta`` holds
+    each row's sketch index, and ``flush_rows`` lists the flush rows followed
+    by -1 padding, walked by ``flush_programs`` CTAs. With
+    ``has_flush_rows=False`` the flush launch is skipped.
     ``run_with_flush(flush, nonflush)`` runs the two launches (default: one
     after the other on the current stream).
     """
@@ -576,14 +644,38 @@ def mamba2_decode(
         *B_cache.stride(), slots.stride(0),
     ]  # fmt: skip
 
-    def flush() -> None:
+    # With "flush_large" knobs, batches that can reach min_batch flush rows
+    # launch both builds; each runs only for its range of flush rows.
+    large = large_batch_config(*_shape_key(dict(shape)))
+    split = large[0] if large is not None and batch >= large[0] else None
+    # The small build then sees fewer than split rows: a grid for those.
+    exts = [(_flush_ext(shape), (0, 1 << 30), flush_programs)]
+    if split is not None:
+        exts = [(exts[0][0], (0, split), min(flush_programs, (split + 3) // 4)),
+                (_flush_ext(shape, True), (split, 1 << 30), flush_programs)]
+
+    def launch(ext, row_range, programs) -> None:
         _flush_launch(
-            _flush_ext(shape), state, x, dt, dt_bias, A, B, C, D, out, x_cache,
-            dt_cache, B_cache, write_pos, is_flush, slots, t.ranks, meta, sketch.u,
+            ext, state, x, dt, dt_bias, A, B, C, D, out, x_cache, dt_cache,
+            B_cache, write_pos, is_flush, slots, t.ranks, meta, sketch.u,
             t.u_offsets, sketch.w, sketch.ag, t.ag_offsets, t.w_offsets, strides,
-            null_block_id, sketch.u.shape[1], sketch.ag.shape[2], sketch.w.shape[1],
-            flush_rows, flush_programs,
+            null_block_id, sketch.u.shape[1], sketch.ag.shape[2],
+            sketch.w.shape[1], flush_rows, programs, frames_t, row_range,
         )  # fmt: skip
+
+    def flush() -> None:
+        if len(exts) == 1:
+            launch(*exts[0])
+            return
+        # The build that does not run for this row count exits at once; on a
+        # stream of its own its exits overlap the other build's work.
+        main = torch.cuda.current_stream()
+        aux = _aux_stream(main.device)
+        aux.wait_stream(main)
+        with torch.cuda.stream(aux):
+            launch(*exts[0])
+        launch(*exts[1])
+        main.wait_stream(aux)
 
     (run_with_flush or _run_with_flush)(flush, nonflush)
 
@@ -609,4 +701,7 @@ def aot_specs(
     if window16_fallback(head_dim, hpg, state_size, window, target):
         out.append((make_spec("mamba2_sketch_flush", dict(default_configs(target)[1], **shape)), True))
         out[0] = (out[0][0], False)
+    large = large_batch_config(head_dim, hpg, state_size, window, target)
+    if large is not None:
+        out.append((make_spec("mamba2_sketch_flush", dict(large[1], **shape)), True))
     return out

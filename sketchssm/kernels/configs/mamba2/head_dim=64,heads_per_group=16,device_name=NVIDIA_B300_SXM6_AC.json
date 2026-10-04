@@ -1,0 +1,9 @@
+{
+    "flush_large": {
+        "WARPS": 4,
+        "MINB": 3,
+        "FL_FRAG_SMEM": 0,
+        "FL_HPW": 4
+    },
+    "flush_large_min_batch": 96
+}

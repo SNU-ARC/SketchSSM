@@ -25,13 +25,14 @@ from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2 import (
     row_list_programs,
     run_with_flush,
     sketch_bc_pre,
+    sketch_query,
 )
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 logger = init_logger(__name__)
 
-SKETCHSSM_KERNELS_API = 2
+SKETCHSSM_KERNELS_API = 3
 
 
 @functools.cache
@@ -133,11 +134,12 @@ def mamba2_cuda_decode(
     if slots.dim() == 2:
         slots = slots[:, 0]
     sketch_bc_pre(B, C, B_cache, write_pos, is_flush, bc_pre, slots, null_block_id)
+    query = sketch_query(C, sketch.frames_t)
     _kernels().mamba2_decode(
-        state, x, dt, A, B, C, D, dt_bias, x_cache, dt_cache, B_cache, bc_pre,
-        write_pos, is_flush, flush_rows, slots, meta, out, sketch, null_block_id,
-        has_flush_rows, flush_programs=row_list_programs(batch),
-        run_with_flush=run_with_flush,
+        state, x, dt, A, B, query, D, dt_bias, x_cache, dt_cache, B_cache,
+        bc_pre, write_pos, is_flush, flush_rows, slots, meta, out, sketch,
+        null_block_id, has_flush_rows, frames_t=sketch.frames_t,
+        flush_programs=row_list_programs(batch), run_with_flush=run_with_flush,
     )  # fmt: skip
 
 

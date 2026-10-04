@@ -16,7 +16,6 @@ from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2 import (
     SketchTables,
     sketch_build,
     sketch_rotate,
-    sketch_rotate_,
     sketch_shapes,
 )
 from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2_triton import (
@@ -87,10 +86,6 @@ class Mamba2SketchSSM(torch.nn.Module):
         )  # fmt: skip
         self._decode = mamba2_cuda_decode if use_cuda else sketch_triton_decode
 
-    def rotate_(self, B: torch.Tensor, C: torch.Tensor) -> None:
-        """Rotate B and C ``(tokens, groups * state_size)`` in place."""
-        sketch_rotate_(B, C, self.frames_t)
-
     def rotate(
         self, B: torch.Tensor, C: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -114,8 +109,9 @@ class Mamba2SketchSSM(torch.nn.Module):
         state_indices: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
-        """One decode step; arguments as for the ReplaySSM decode."""
-        sketch = SketchArgs(self.u, self.w, self.ag, self.tables)
+        """One decode step with unrotated B and C; arguments as for the
+        ReplaySSM decode."""
+        sketch = SketchArgs(self.u, self.w, self.ag, self.tables, self.frames_t)
         if state_indices.dim() == 2:
             state_indices = state_indices[:, 0]
         self._decode(
@@ -129,7 +125,7 @@ class Mamba2SketchSSM(torch.nn.Module):
         self, state: torch.Tensor, attn_metadata, state_indices: torch.Tensor
     ) -> None:
         """Build the sketch of each prefill row that completes its prompt."""
-        sketch = SketchArgs(self.u, self.w, self.ag, self.tables)
+        sketch = SketchArgs(self.u, self.w, self.ag, self.tables, self.frames_t)
         sketch_build(
             state, attn_metadata.sketch_build_p, state_indices,
             attn_metadata.sketch_meta_p, sketch,

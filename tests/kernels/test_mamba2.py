@@ -8,7 +8,8 @@ tiles. A non-flush read must match the read of the stored sketch
 (U, maps, AG) up to BF16 output rounding, and the stored sketch must match
 the four-pivot residual-diagonal read solved directly (``sketch_coeff``) up
 to its BF16 storage; dense heads read the plain state. Flushes are checked
-against the exact FP64 replay of the window.
+against the exact FP64 replay of the window. The state lives in random
+per-group frames R; B and C arrive unrotated, the oracles rotate in FP64.
 """
 
 import json
@@ -61,12 +62,14 @@ def skip_unsupported(shape, state_size, window) -> None:
 
 def decode(state, x, dt, A, B, C, D, dt_bias, x_cache, dt_cache, B_cache, bc_pre,
            write_pos, is_flush, flush_rows, slots, meta, out, sketch):  # fmt: skip
-    """vLLM's call: fill ``bc_pre``, then the decode with its flush stream."""
+    """vLLM's call: fill ``bc_pre`` and the FP32 query, then the decode with
+    its flush stream."""
     sk.sketch_bc_pre(B, C, B_cache, write_pos, is_flush, bc_pre, slots, NULL)
+    query = sk.sketch_query(C, sketch.frames_t)
     kernels.mamba2_decode(
-        state, x, dt, A, B, C, D, dt_bias, x_cache, dt_cache, B_cache, bc_pre,
+        state, x, dt, A, B, query, D, dt_bias, x_cache, dt_cache, B_cache, bc_pre,
         write_pos, is_flush, flush_rows, slots, meta, out, sketch, NULL,
-        flush_programs=sk.row_list_programs(x.shape[0]),
+        frames_t=sketch.frames_t, flush_programs=sk.row_list_programs(x.shape[0]),
         run_with_flush=sk.run_with_flush,
     )  # fmt: skip
 
@@ -134,7 +137,13 @@ class Layer:
             torch.zeros(batch, *s, dtype=d).cuda()
             for s, d in zip(shapes, sk.SKETCH_DTYPES)
         )
-        self.sketch = sk.SketchArgs(u, w, ag, tables=sk.SketchTables(ranks, N).cuda())
+        frames = torch.linalg.qr(torch.randn(G, N, N, generator=g))[0]
+        frames_t = frames.transpose(-1, -2).contiguous().cuda()
+        # Row vectors rotate as v @ frames_t.
+        self.rot = frames_t.double().cpu()
+        self.sketch = sk.SketchArgs(
+            u, w, ag, tables=sk.SketchTables(ranks, N).cuda(), frames_t=frames_t
+        )
         # B/C slices of one row buffer, as in the model.
         self.conv = torch.empty(batch, H * P + 2 * G * N).cuda().to(dtype)
 
@@ -218,8 +227,13 @@ class Layer:
             torch.exp(a * cs[-1]),
             weights,
             values.double().cpu(),
-            keys.double().cpu(),
+            keys.double().cpu() @ self.rot[g],
         )
+
+    def query(self, C, row, h):
+        """The FP64 rotated query of head ``h``."""
+        g = h // (self.H // self.G)
+        return C[row, g].double().cpu() @ self.rot[g]
 
 
 @pytest.mark.parametrize(("shape", "state_size", "window"), CASES)
@@ -235,7 +249,6 @@ def test_mamba2_decode(shape, state_size, window):
         # first tile boundary and read in the middle of the window.
         offsets = torch.tensor([L - 17, L // 2 + 1, L - 9, L - 1, 3])
     layer.build(torch.ones(batch, dtype=torch.int8).cuda())
-    ratio = layer.H // layer.G
     for t in range(20):
         if t == 9:
             # Rows are reordered; sketches follow the requests.
@@ -249,7 +262,7 @@ def test_mamba2_decode(shape, state_size, window):
         x, dt, B, C = layer.inputs()
         s0 = layer.state.double().cpu()
         stored = {
-            (row, h): layer.stored_read(row, h, C[row, h // ratio].double().cpu())
+            (row, h): layer.stored_read(row, h, layer.query(C, row, h))
             for row in range(batch)
             for h in range(layer.H)
             if int(pos[row]) != L - 1
@@ -259,7 +272,7 @@ def test_mamba2_decode(shape, state_size, window):
             p = int(pos[row])
             for h, m in enumerate(layer.ranks):
                 decay, w, values, keys = layer.window(slot, row, h, p, x, dt, B)
-                q = C[row, h // ratio].double().cpu()
+                q = layer.query(C, row, h)
                 skip = layer.D[h].double().cpu() * values[-1]
                 if p == L - 1:
                     s = decay * s0[slot, h] + (values * w[:, None]).T @ keys
@@ -328,7 +341,8 @@ def test_mamba2_window16_config_fallback(config_dir, clear_caches, monkeypatch):
         return ext
 
     monkeypatch.setattr(mk, "_build", record)
-    clear_caches(mk.tuned_config, mk.window16_fallback, mk._nf_ext, mk._flush_ext)
+    clear_caches(mk.tuned_config, mk.large_batch_config, mk.window16_fallback, mk._nf_ext,
+                 mk._flush_ext)
     assert mk.window16_fallback(P, H // G, state_size, window)
     nf, flush = mk.tuned_config(P, H // G, state_size, window)
     assert (nf["NF_HEADS"], flush["WARPS"]) == (16, 4)

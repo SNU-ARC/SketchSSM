@@ -18,8 +18,6 @@
         "NF_PF_BULK": 0
     },
     "flush": {
-        "WARPS": 1,
-        "MINB": 9,
         "QREG": 0,
         "PREFETCH": 1,
         "UNROLL": 1,

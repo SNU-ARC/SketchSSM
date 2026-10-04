@@ -58,6 +58,7 @@ COMPONENTS = {
     "shared B/C": [r"^_bc_pre_kernel", r"^_replayssm_output_only_precompute_kernel"],
     "basis transform": [
         r"^_rot_inplace_kernel", r"^_rotate_groups_kernel", r"^_rotate_qk_kernel",
+        r"^_window_keys_kernel",
     ],
 }
 

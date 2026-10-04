@@ -7,7 +7,7 @@ if(DEFINED ENV{SKETCHSSM_SRC_DIR})
 endif()
 
 set(SKETCHSSM_GIT_REPOSITORY "https://github.com/SNU-ARC/SketchSSM.git")
-set(SKETCHSSM_GIT_TAG "v0.1.8")
+set(SKETCHSSM_GIT_TAG "v0.1.9")
 set(SKETCHSSM_KERNELS_SUBDIR "sketchssm/kernels")
 set(SKETCHSSM_KERNELS_DEST "vllm/third_party/sketchssm_kernels")
 

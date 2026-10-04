@@ -1096,8 +1096,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_d
             )
-            if self.sketchssm is not None:
-                self.sketchssm.rotate_(B_d, C_d)
 
             # 3. State Space Model sequence transformation
             n_groups = self.n_groups // self.tp_size

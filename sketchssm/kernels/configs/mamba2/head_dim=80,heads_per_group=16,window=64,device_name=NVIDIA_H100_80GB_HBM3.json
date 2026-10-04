@@ -5,7 +5,5 @@
         "NF_SMAPS": 1,
         "NF_PF_ROWS": 2
     },
-    "flush": {
-        "WARPS": 2
-    }
+    "flush": {}
 }

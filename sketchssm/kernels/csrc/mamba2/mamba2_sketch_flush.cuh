@@ -74,7 +74,7 @@ struct FlushStrides {
   long dts0, dts1;              // dt: row, head
   long biass0, as0;             // dt bias, A: head
   long bs0, bs1, bs2;           // B: row, group, key
-  long cs0, cs1, cs2;           // C: row, group, key
+  long cs0, cs1, cs2;           // C (the FP32 query): row, group, key
   long ds0, ds1;                // D: head, value
   long os0, os1, os2;           // out: row, head, value
   long xrs0, xrs1, xrs2, xrs3;  // x ring: slot, head, t, value
@@ -162,7 +162,11 @@ __device__ __forceinline__ int vmap(int j, int n) {
 #ifndef UNROLL
 #define UNROLL 1
 #endif
-#define RING_PITCH (SK_N + 8)
+// Window keys of the CTA's group in shared memory: the unrotated BF16 keys (pitch 16 B mod
+// 128 B, conflict-free for ldmatrix) and the rotated FP32 keys R B_t (pitch 4 mod 32 words,
+// conflict-free for the fold's A-fragment loads).
+#define BRING_PITCH (SK_N + 8)
+#define RING_PITCH (SK_N + 4)
 // FL_STAGES=n (>= 2): the state tiles are streamed through an n-deep shared-memory cp.async
 // pipeline instead of register prefetch (frees the 32 prefetch registers and their 32 moves
 // per block and keeps n-1 tiles in flight per warp).
@@ -208,7 +212,7 @@ __device__ __forceinline__ int vmap(int j, int n) {
 #ifndef FL_EARLY
 #define FL_EARLY 0
 #endif
-// FL_CSMEM=1: the group's C row (128 bf16) is staged in shared memory once instead of being
+// FL_CSMEM=1: the group's query row (SK_N fp32) is staged in shared memory once instead of being
 // loaded from global memory (two values per lane) in every key block.
 #ifndef FL_CSMEM
 #define FL_CSMEM 0
@@ -277,7 +281,6 @@ struct __align__(16) WarpShared {
 #elif FL_STAGES
   float4 stile[FL_STAGES][FL_HALF ? 8 * (SK_P / 4) : 16 * (SK_P / 4)];   // state tiles (or half tiles) in flight
 #endif
-  bf16 ring[SK_W * RING_PITCH]; // window keys (t, key), zero beyond wp
 #if FL_WSMEM
   bf16 xw[SK_W * XW_PITCH];     // x window (t, permuted value column), zero beyond wp
   float sc[SK_W];               // per-step scales
@@ -292,9 +295,190 @@ struct __align__(16) WarpShared {
   bf16 xs[16 * XS_PITCH];       // x window (t, value), zero beyond wp
 #endif
 #if FL_CSMEM
-  bf16 crow[SK_N];              // the group's C row
+  float crow[SK_N];             // the group's query row
 #endif
 };
+
+// The flush rotates the group's window keys R B_t once per CTA (its WARPS heads share them): the
+// keys are staged as FP16 (exact for BF16 keys of magnitude 2^-14 .. 65504; smaller ones keep an
+// absolute error below 2^-25) and the frame, scaled by 2^8 so that both terms stay normal, is
+// split into two FP16 terms (22 bits). Two MMAs per key block with FP32 accumulation.
+// FL_FRAG_SMEM=1 (state sizes up to 128): the CTA converts its group frame once into MMA B
+// fragments in shared memory (N^2 * 4 bytes); otherwise each warp reads its frame columns from
+// global memory (L2) per row, up to two 8-key blocks at a time.
+#ifndef FL_FRAG_SMEM
+#define FL_FRAG_SMEM 0
+#endif
+#if FL_FRAG_SMEM && SK_N > 128
+#error "FL_FRAG_SMEM needs a state size of at most 128"
+#endif
+#define FL_KW (SK_N / WARPS)
+__device__ __forceinline__ void mma16816_f16(float* d, const uint32_t* a, const uint32_t* b) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+__device__ __forceinline__ uint32_t pack_h2(float lo, float hi) {
+  uint32_t r;
+  asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+  return r;
+}
+__device__ __forceinline__ float2 unpack_h2(uint32_t v) {
+  float lo, hi;
+  asm("{\n .reg .b16 l, h;\n mov.b32 {l, h}, %2;\n cvt.f32.f16 %0, l;\n cvt.f32.f16 %1, h;\n}\n"
+      : "=f"(lo), "=f"(hi) : "r"(v));
+  return make_float2(lo, hi);
+}
+// Two BF16 values -> the same two values in FP16.
+__device__ __forceinline__ uint32_t bf2h2(uint32_t v) {
+  return pack_h2(__uint_as_float(v << 16), __uint_as_float(v & 0xffff0000u));
+}
+// Shared by the CTA's warps (heads of one group): the group's window keys, rotated once.
+struct __align__(16) CtaShared {
+  bf16 bring[SK_W * BRING_PITCH];   // unrotated window keys (t, key), zero beyond wp
+  float ring[SK_W * RING_PITCH];    // rotated window keys R B_t (t, key) in FP32
+#if FL_FRAG_SMEM
+  uint4 frag[SK_N * SK_N / 4];      // frame B fragments (ks, 8-key block, lane): {hi, hi, lo, lo}
+#endif
+};
+// FL_HPW: heads per warp, so that a CTA serves WARPS * FL_HPW heads of one group and rotates their
+// window keys once.
+#ifndef FL_HPW
+#define FL_HPW 1
+#endif
+static_assert(SK_HPG % (WARPS * FL_HPW) == 0, "the heads of a flush CTA must share one group (WARPS * FL_HPW | SK_HPG)");
+static_assert(SK_N % (8 * WARPS) == 0, "each warp rotates whole 8-key blocks (8 WARPS | SK_N)");
+#define FL_DYN_SMEM (sizeof(WarpShared) * WARPS + sizeof(CtaShared))
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t* r, const void* p) {
+  uint32_t addr = (uint32_t)__cvta_generic_to_shared(p);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+}
+
+// Frame entries (16 ks + 2 c + {0, 1, 8, 9}, k) as the FP16 B fragments {hi, hi, lo, lo}.
+__device__ __forceinline__ uint4 frame_frag(float f0, float f1, float f2, float f3) {
+  f0 *= 256.f; f1 *= 256.f; f2 *= 256.f; f3 *= 256.f;
+  const uint32_t h0 = pack_h2(f0, f1), h1 = pack_h2(f2, f3);
+  const float2 r0 = unpack_h2(h0), r1 = unpack_h2(h1);
+  return make_uint4(h0, h1, pack_h2(f0 - r0.x, f1 - r0.y), pack_h2(f2 - r1.x, f3 - r1.y));
+}
+
+// Window tile wt: acc[j] (hi and lo terms) += keys(16 wt.., 16 ks..) x fragment j.
+template <int NB>
+__device__ __forceinline__ void rot_step(const CtaShared& csh, int lane, int wt, int ks, const uint4 (&f)[NB],
+                                         float (&ah)[NB][4], float (&al)[NB][4]) {
+  uint32_t a[4];
+  ldmatrix_x4(a, csh.bring + (16 * wt + (lane & 15)) * BRING_PITCH + 16 * ks + 8 * (lane >> 4));
+  #pragma unroll
+  for (int j = 0; j < NB; ++j) {
+    const uint32_t bh[2] = {f[j].x, f[j].y}, bl[2] = {f[j].z, f[j].w};
+    mma16816_f16(al[j], a, bl);
+    mma16816_f16(ah[j], a, bh);
+  }
+}
+
+template <int NB>
+__device__ __forceinline__ void rot_store(CtaShared& csh, int lane, int wt, int k0, float (&ah)[NB][4], float (&al)[NB][4]) {
+  const int gq = lane >> 2, c = lane & 3;
+  #pragma unroll
+  for (int j = 0; j < NB; ++j) {
+    float* o = csh.ring + (16 * wt + gq) * RING_PITCH + k0 + 8 * j + 2 * c;
+    constexpr float s = 1.f / 256.f;
+    *reinterpret_cast<float2*>(o) = make_float2((ah[j][0] + al[j][0]) * s, (ah[j][1] + al[j][1]) * s);
+    *reinterpret_cast<float2*>(o + 8 * RING_PITCH) = make_float2((ah[j][2] + al[j][2]) * s, (ah[j][3] + al[j][3]) * s);
+  }
+}
+
+// The global-memory path rotates a warp's keys in passes of FL_PK 8-key blocks; a pass's frame
+// entries (FL_PF per lane) are loaded at once.
+#define FL_PK ((FL_KW / 8) < 2 ? FL_KW / 8 : 2)
+#define FL_PF (SK_N / 16 * FL_PK * 4)
+__device__ __forceinline__ void load_pass(int lane, const float* __restrict__ Fr, int k0, float (&f)[FL_PF]) {
+  const float* fr0 = Fr + (long)(2 * (lane & 3)) * SK_N + k0 + (lane >> 2);
+  #pragma unroll
+  for (int ks = 0; ks < SK_N / 16; ++ks)
+    #pragma unroll
+    for (int j = 0; j < FL_PK; ++j) {
+      const float* p = fr0 + (long)16 * ks * SK_N + 8 * j;
+      float* q = f + 4 * (ks * FL_PK + j);
+      q[0] = p[0]; q[1] = p[SK_N]; q[2] = p[8 * SK_N]; q[3] = p[9 * SK_N];
+    }
+}
+
+// csh.ring[t][k] = sum_n bring[t][n] Fr[n][k] for the keys k of this warp (Fr = R^T of the
+// group, FP32 (N, N), read from global memory); without frames the keys are copied.
+__device__ __forceinline__ void rotate_window(int warp, int lane, const float* __restrict__ Fr,
+                                              CtaShared& csh) {
+  const int k0w = warp * FL_KW;
+  if (Fr == nullptr) {
+    for (int i = lane; i < SK_W * FL_KW; i += 32) {
+      const int t = i / FL_KW, k = k0w + i % FL_KW;
+      csh.ring[t * RING_PITCH + k] = unpack_h2(*reinterpret_cast<const unsigned short*>(csh.bring + t * BRING_PITCH + k)).x;
+    }
+    return;
+  }
+  #pragma unroll 1
+  for (int k0 = k0w; k0 < k0w + FL_KW; k0 += 8 * FL_PK) {
+    float f[FL_PF];
+    load_pass(lane, Fr, k0, f);
+    #pragma unroll 1
+    for (int wt = 0; wt < SK_WT; ++wt) {
+      float ah[FL_PK][4], al[FL_PK][4];
+      #pragma unroll
+      for (int j = 0; j < FL_PK; ++j)
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) ah[j][e] = al[j][e] = 0.f;
+      #pragma unroll
+      for (int ks = 0; ks < SK_N / 16; ++ks) {
+        uint4 fr[FL_PK];
+        #pragma unroll
+        for (int j = 0; j < FL_PK; ++j) {
+          const float* q = f + 4 * (ks * FL_PK + j);
+          fr[j] = frame_frag(q[0], q[1], q[2], q[3]);
+        }
+        rot_step<FL_PK>(csh, lane, wt, ks, fr, ah, al);
+      }
+      rot_store<FL_PK>(csh, lane, wt, k0, ah, al);
+    }
+  }
+}
+
+#if FL_FRAG_SMEM
+// csh.frag from the group's frame Fr (once per CTA, all threads).
+__device__ __forceinline__ void fill_frag(const float* __restrict__ Fr, CtaShared& csh) {
+  constexpr int NBT = SK_N / 8;
+  for (int i = threadIdx.x; i < SK_N * SK_N / 4; i += 32 * WARPS) {
+    const int lane = i & 31, rest = i >> 5, nb = rest % NBT, ks = rest / NBT;
+    const float* p = Fr + (long)(16 * ks + 2 * (lane & 3)) * SK_N + 8 * nb + (lane >> 2);
+    csh.frag[i] = frame_frag(p[0], p[SK_N], p[8 * SK_N], p[9 * SK_N]);
+  }
+}
+
+// rotate_window with the fragments of csh.frag.
+__device__ __forceinline__ void rotate_window_frag(int warp, int lane, CtaShared& csh) {
+  constexpr int NB = (FL_KW / 8) < 4 ? FL_KW / 8 : 4, NBT = SK_N / 8;
+  #pragma unroll 1
+  for (int wt = 0; wt < SK_WT; ++wt) {
+    #pragma unroll 1
+    for (int k0 = warp * FL_KW; k0 < (warp + 1) * FL_KW; k0 += 8 * NB) {
+      float ah[NB][4], al[NB][4];
+      #pragma unroll
+      for (int j = 0; j < NB; ++j)
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) ah[j][e] = al[j][e] = 0.f;
+      #pragma unroll 4
+      for (int ks = 0; ks < SK_N / 16; ++ks) {
+        uint4 f[NB];
+        #pragma unroll
+        for (int j = 0; j < NB; ++j) f[j] = csh.frag[(ks * NBT + k0 / 8 + j) * 32 + lane];
+        rot_step<NB>(csh, lane, wt, ks, f, ah, al);
+      }
+      rot_store<NB>(csh, lane, wt, k0, ah, al);
+    }
+  }
+}
+#endif
 
 // Element n of the SK_N-vector distributed as SK_KF consecutive values per lane.
 __device__ __forceinline__ float elem(float v0, float v1, int n) {
@@ -637,20 +821,25 @@ __device__ __forceinline__ void block_stats(const float (&acc)[2 * SK_NP][4], co
 extern "C" __global__ void __launch_bounds__(32 * WARPS, MINB)
 flush_kernel(float* __restrict__ S, const bf16* __restrict__ X, const bf16* __restrict__ DT,
              const bf16* __restrict__ Bias, const float* __restrict__ A, const bf16* __restrict__ B,
-             const bf16* __restrict__ C, const bf16* __restrict__ D, void* __restrict__ O,
+             const float* __restrict__ C, const bf16* __restrict__ D, void* __restrict__ O,
              bf16* __restrict__ XR, float* __restrict__ DR, bf16* __restrict__ BR,
              const int* __restrict__ WP, const unsigned char* __restrict__ FL,
              const int* __restrict__ Slots, const int* __restrict__ Width, const int* __restrict__ Map,
              uw_t* __restrict__ Sketch, const int* __restrict__ SkOff, uw_t* __restrict__ Tail,
              float* __restrict__ AG, const int* __restrict__ Offsets, const int* __restrict__ WOff,
              FlushStrides st, int null_slot, int softplus, int out_f32, int SKROWS, int SM, int WROWS,
-             const int* __restrict__ Rows, int batch) {
-#if FL_WSMEM
+             const int* __restrict__ Rows, int batch, const float* __restrict__ Frames,
+             int min_rows, int max_rows) {
+#if FL_ROW_LIST
+  // Run only when the number of flush rows (Rows is -1 padded) is in [min_rows, max_rows), so
+  // that two builds can split the flush by its row count on the device.
+  if (min_rows > 0 && (min_rows > batch || Rows[min_rows - 1] < 0)) return;
+  if (max_rows <= 0 || (max_rows <= batch && Rows[max_rows - 1] >= 0)) return;
+#endif
   extern __shared__ __align__(16) unsigned char fl_smem[];
   WarpShared* shared = reinterpret_cast<WarpShared*>(fl_smem);
-#else
-  __shared__ WarpShared shared[WARPS];
-#endif
+  CtaShared& csh = *reinterpret_cast<CtaShared*>(fl_smem + sizeof(WarpShared) * WARPS);
+  bool frag_ready = false;                          // csh.frag holds the CTA's group frame
 #if FL_ROW_LIST
   const int hb = blockIdx.y;
   const int nrows = batch;
@@ -674,7 +863,37 @@ flush_kernel(float* __restrict__ S, const bf16* __restrict__ X, const bf16* __re
   if (slot == null_slot) return;
 #endif
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int h = hb * WARPS + warp;
+  const int group = hb * WARPS * FL_HPW / SK_HPG;
+  const float* frames = Frames ? Frames + (long)group * SK_N * SK_N : nullptr;
+  const int wp = WP[row];
+  // Stage the group's unrotated window keys (rows t < wp from the ring, row wp from B) with the
+  // whole CTA, then rotate them once for its heads: csh.ring = R B_t in FP32.
+  const bf16* brp = BR + slot * st.brs0 + group * st.brs1;
+  const bf16* bp = B + row * st.bs0 + group * st.bs1;
+#if FL_FRAG_SMEM
+  if (frames && !frag_ready) { fill_frag(frames, csh); frag_ready = true; }
+#endif
+  __syncthreads();                                  // the previous row's fold is done with csh
+  for (int ch = threadIdx.x; ch < SK_W * SK_N / 8; ch += 32 * WARPS) {
+    const int t = ch / (SK_N / 8), part = ch % (SK_N / 8);
+    uint4 v = make_uint4(0u, 0u, 0u, 0u);
+    if (t < wp) v = *reinterpret_cast<const uint4*>(brp + t * st.brs2 + part * 8);
+    else if (t == wp) v = *reinterpret_cast<const uint4*>(bp + part * 8);
+    v = make_uint4(bf2h2(v.x), bf2h2(v.y), bf2h2(v.z), bf2h2(v.w));   // keys as FP16
+    *reinterpret_cast<uint4*>(csh.bring + t * BRING_PITCH + part * 8) = v;
+  }
+  __syncthreads();
+#if FL_FRAG_SMEM
+  if (frames) rotate_window_frag(warp, lane, csh);
+  else rotate_window(warp, lane, nullptr, csh);
+#else
+  rotate_window(warp, lane, frames, csh);
+#endif
+  __syncthreads();
+  // The CTA's heads: FL_HPW per warp, one after the other.
+  #pragma unroll 1
+  for (int hh = 0; hh < FL_HPW; ++hh) {
+  const int h = (hb * FL_HPW + hh) * WARPS + warp;
 #if FL_PF_ROWS > 0
   // Row + FL_PF_ROWS bookkeeping, loaded with the prologue and consumed after block 0.
   const int rp = row + FL_PF_ROWS;
@@ -682,9 +901,7 @@ flush_kernel(float* __restrict__ S, const bf16* __restrict__ X, const bf16* __re
   const int sp2 = pf_row ? Slots[rp * st.slots] : null_slot;
   const int wp2 = pf_row ? WP[rp] : 0;
 #endif
-  const int group = h / SK_HPG;
   const int g = lane >> 2, c = lane & 3;
-  const int wp = WP[row];
 #if FL_DENSE
   const int m = 0;                                  // no sketch: the rank branches compile out
   const long meta_row = 0;
@@ -803,17 +1020,6 @@ flush_kernel(float* __restrict__ S, const bf16* __restrict__ X, const bf16* __re
   const float s2 = __shfl_sync(FULL, scale[0], 2 * c + 8), s3 = __shfl_sync(FULL, scale[0], 2 * c + 9);
 #endif
 
-  // Stage window keys for the group: rows t < wp from the ring, row wp from B.
-  const bf16* brp = BR + slot * st.brs0 + group * st.brs1;
-  const bf16* bp = B + row * st.bs0 + group * st.bs1;
-  #pragma unroll
-  for (int i = 0; i < SK_NKB * SK_WT; ++i) {
-    const int ch = lane + 32 * i, t = ch / (SK_N / 8), part = ch % (SK_N / 8);
-    uint4 v = make_uint4(0u, 0u, 0u, 0u);
-    if (t < wp) v = *reinterpret_cast<const uint4*>(brp + t * st.brs2 + part * 8);
-    else if (t == wp) v = *reinterpret_cast<const uint4*>(bp + part * 8);
-    *reinterpret_cast<uint4*>(sh.ring + t * RING_PITCH + part * 8) = v;
-  }
   // Window values as MMA B fragments (t along k, permuted value columns).
   // Value stride is one element for both the ring and x (checked by the wrapper).
   const bf16* xrp = XR + slot * st.xrs0 + h * st.xrs1;
@@ -831,9 +1037,9 @@ flush_kernel(float* __restrict__ S, const bf16* __restrict__ X, const bf16* __re
 #endif
 #if FL_CSMEM
   #pragma unroll
-  for (int i = 0; i < (SK_N + 255) / 256; ++i) {
+  for (int i = 0; i < (SK_N + 127) / 128; ++i) {
     const int ch = lane + 32 * i;
-    if (ch < SK_N / 8) *reinterpret_cast<uint4*>(sh.crow + ch * 8) = *reinterpret_cast<const uint4*>(C + row * st.cs0 + group * st.cs1 + ch * 8);
+    if (ch < SK_N / 4) *reinterpret_cast<float4*>(sh.crow + ch * 4) = *reinterpret_cast<const float4*>(C + row * st.cs0 + group * st.cs1 + ch * 4);
   }
 #endif
 #if FL_XSMEM
@@ -893,7 +1099,7 @@ flush_kernel(float* __restrict__ S, const bf16* __restrict__ X, const bf16* __re
   __syncwarp();
 
   uw_t* up = Sketch + (meta_row * SKROWS + skoff) * SK_P;
-  const bf16* cp = C + row * st.cs0 + group * st.cs1;
+  const float* cp = C + row * st.cs0 + group * st.cs1;
 #if FL_OUTSMEM
   if (lane < SK_P / 4) *reinterpret_cast<float4*>(sh.o + 4 * lane) = make_float4(0.f, 0.f, 0.f, 0.f);
   float out[4 * SK_NP];   // only the final readout after the loop
@@ -919,7 +1125,7 @@ flush_kernel(float* __restrict__ S, const bf16* __restrict__ X, const bf16* __re
     fl_pf_if(reinterpret_cast<const char*>(S + (long)sp2 * st.ss0 + h * st.ss1) + lane * 128, true);   // state block 0
     fl_pf_if(X + (long)rp * st.xs0 + h * st.xs1, lane == 0);
     fl_pf_if(DR + (long)sp2 * st.drs0 + h * st.drs1, lane == 1);
-    fl_pf_if(C + (long)rp * st.cs0 + group * st.cs1 + 64 * (lane & 1), lane < 4 && lane >= 2);
+    fl_pf_if(C + (long)rp * st.cs0 + group * st.cs1 + 32 * (lane & 3), lane < 6 && lane >= 2);
     if ((h % SK_HPG) == 0) {   // window keys are per group
       fl_pf_if(BR + (long)sp2 * st.brs0 + group * st.brs1 + (lane >> 1) * st.brs2 + 64 * (lane & 1), (lane >> 1) < wp2);
       fl_pf_if(B + (long)rp * st.bs0 + group * st.bs1 + 64 * (lane & 1), lane < 2);
@@ -950,11 +1156,11 @@ flush_kernel(float* __restrict__ S, const bf16* __restrict__ X, const bf16* __re
     if (kb > 0) pf_block(kb - 1 + PF_FIRST + FL_PF_BLOCKS);   // keeps FL_PF_BLOCKS blocks ahead of the stages
 #endif
 #if FL_CSMEM
-    const float cq0 = __bfloat162float(sh.crow[k0 + g]);
-    const float cq1 = __bfloat162float(sh.crow[k0 + g + 8]);
+    const float cq0 = sh.crow[k0 + g];
+    const float cq1 = sh.crow[k0 + g + 8];
 #else
-    const float cq0 = __bfloat162float(cp[(k0 + g) * st.cs2]);
-    const float cq1 = __bfloat162float(cp[(k0 + g + 8) * st.cs2]);
+    const float cq0 = cp[(k0 + g) * st.cs2];
+    const float cq1 = cp[(k0 + g + 8) * st.cs2];
 #endif
 #if FL_STAGES && !FL_HALF
     wait_unit(kb);
@@ -971,18 +1177,16 @@ flush_kernel(float* __restrict__ S, const bf16* __restrict__ X, const bf16* __re
     }
 #endif
     // Window contribution of this 16-key block, accumulated over the 16-step window tiles:
-    // acc = sum_t (s_t B_t)(keys) x_t(values), with the scaled keys split into three BF16 parts.
+    // acc = sum_t (s_t R B_t)(keys) x_t(values), with the FP32 scaled keys split into three
+    // BF16 parts (x_t is BF16, so the products are exact up to the third part's rounding).
     float acc[2 * SK_NP][4];
     #pragma unroll
     for (int j = 0; j < 2 * SK_NP; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
     #pragma unroll
     for (int wt = 0; wt < SK_WT; ++wt) {
-      // A fragments for this 16-key block and window tile through transposed ldmatrix.
-      uint32_t a[4];
-      {
-        const int qd = lane >> 3, r = lane & 7;
-        ldmatrix_x4_trans(a, sh.ring + (16 * wt + (qd >> 1) * 8 + r) * RING_PITCH + k0 + (qd & 1) * 8);
-      }
+      // A fragment r of this 16-key block and window tile: keys k0 + g + 8 (r & 1), steps
+      // 16 wt + 2 c + 8 (r >> 1) + {0, 1}.
+      const float* ra = csh.ring + (16 * wt + 2 * c) * RING_PITCH + k0 + g;
 #if FL_WSMEM
       const float2 sa = *reinterpret_cast<const float2*>(sh.sc + 16 * wt + 2 * c);
       const float2 sb = *reinterpret_cast<const float2*>(sh.sc + 16 * wt + 2 * c + 8);
@@ -998,7 +1202,8 @@ flush_kernel(float* __restrict__ S, const bf16* __restrict__ X, const bf16* __re
       uint32_t p0[4], p1[4], p2[4];
       #pragma unroll
       for (int r = 0; r < 4; ++r) {
-        float2 f = unpack2(a[r]);
+        const float* rk = ra + 8 * (r >> 1) * RING_PITCH + 8 * (r & 1);
+        float2 f = make_float2(rk[0], rk[RING_PITCH]);
         f.x *= (r & 2) ? s2 : s0; f.y *= (r & 2) ? s3 : s1;
         p0[r] = pack2(f.x, f.y);
         float2 y = unpack2(p0[r]); f.x -= y.x; f.y -= y.y;
@@ -1207,6 +1412,7 @@ flush_kernel(float* __restrict__ S, const bf16* __restrict__ X, const bf16* __re
   __syncwarp();
   if (m > 0) finish(lane, m, meta_row, WOff[h], Offsets[h], sh, Tail, AG, SM, WROWS);
 #endif
+  }   // heads
 #if FL_ROW_LIST
   __syncwarp();
   }

@@ -3,7 +3,10 @@
 """SketchSSM Mamba-2 decode kernels (Triton).
 
 Non-flush rows read their sketch; flush rows replay the window into the full
-state as ReplaySSM does, and their sketches are rebuilt afterwards.
+state as ReplaySSM does, and their sketches are rebuilt afterwards. B and C
+arrive unrotated: the ring and ``bc_pre`` use them as they are, the sketch and
+state reads take the FP32 query R·C, and a flush folds the FP32 rotated
+window keys R·B_t into the rotated state.
 """
 
 import torch
@@ -16,6 +19,9 @@ from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2 import (
     run_with_flush,
     sketch_bc_pre,
     sketch_build,
+    sketch_query,
+    sketch_window_keys,
+    sketch_window_scratch,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -130,6 +136,7 @@ def _sketch_decode_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_J: tl.constexpr,
 ):
+    # C_ptr is the FP32 query R·C; B is unrotated (ring append only).
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
     pid_h = tl.program_id(2)
@@ -255,6 +262,7 @@ def _sketch_flush_kernel(
     x_cache_ptr,
     dt_cache_ptr,
     B_cache_ptr,
+    BW_ptr,
     write_pos_ptr,
     flush_rows_ptr,
     slots_ptr,
@@ -263,6 +271,9 @@ def _sketch_flush_kernel(
     dim,
     dstate,
     heads_per_group,
+    stride_BW_batch,
+    stride_BW_group,
+    stride_BW_pos,
     stride_state_slot,
     stride_state_head,
     stride_state_dim,
@@ -302,8 +313,8 @@ def _sketch_flush_kernel(
     BLOCK_K: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
-    # ReplaySSM flush of the rows in flush_rows (-1 padded):
-    # S = decay * S_0 + sum_t s_t x_t B_t^T.
+    # ReplaySSM flush of the rows in flush_rows (-1 padded) in the rotated
+    # frame: S = decay * S_0 + sum_t s_t x_t (R B_t)^T, R B_t from BW.
     pid_m = tl.program_id(0)
     pid_h = tl.program_id(2)
     group = pid_h // heads_per_group
@@ -349,15 +360,15 @@ def _sketch_flush_kernel(
                 stride_dt_cache_pos, stride_x_cache_pos, stride_x_cache_dim,
                 BLOCK_K,
             )  # fmt: skip
-            B_cur = tl.load(B_row + offs_n * stride_B_dstate, mask=nmask, other=0.0)
             B_all = tl.load(
-                B_ring
-                + offs_k[:, None] * stride_B_cache_pos
-                + offs_n[None, :] * stride_B_cache_dstate,
-                mask=(offs_k[:, None] < wp) & nmask[None, :],
+                BW_ptr
+                + row.to(tl.int64) * stride_BW_batch
+                + group * stride_BW_group
+                + offs_k[:, None] * stride_BW_pos
+                + offs_n[None, :],
+                mask=(offs_k[:, None] <= wp) & nmask[None, :],
                 other=0.0,
             )
-            B_all = tl.where(offs_k[:, None] == wp, B_cur[None, :], B_all)
             s_ptrs = (
                 state_ptr
                 + slot * stride_state_slot
@@ -367,11 +378,7 @@ def _sketch_flush_kernel(
             )
             smask = mmask[:, None] & nmask[None, :]
             s = tl.load(s_ptrs, mask=smask, other=0.0) * decay
-            s += tl.dot(
-                x_all * scale[None, :],
-                B_all.to(tl.float32),
-                input_precision=DOT_PRECISION,
-            )
+            s += tl.dot(x_all * scale[None, :], B_all, input_precision=DOT_PRECISION)
             tl.store(s_ptrs, s, mask=smask)
             y = tl.sum(s * C[None, :], axis=1)
             if HAS_D:
@@ -392,6 +399,7 @@ def _sketch_flush_kernel(
             if pid_m == 0:
                 tl.store(dt_ring + wp * stride_dt_cache_pos, dt_cur)
                 if pid_h % heads_per_group == 0:
+                    B_cur = tl.load(B_row + offs_n * stride_B_dstate, mask=nmask)
                     tl.store(
                         B_ring + wp * stride_B_cache_pos
                         + offs_n * stride_B_cache_dstate,
@@ -427,8 +435,9 @@ def sketch_triton_decode(
 ) -> None:
     """One SketchSSM decode step of a Mamba-2 layer.
 
-    Shapes follow ``selective_state_update_replayssm_output_only``; B/C must
-    already be rotated and ``flush_rows`` is -1 padded.
+    Shapes follow ``selective_state_update_replayssm_output_only``; B/C are
+    unrotated (rotated here by ``sketch.frames_t``) and ``flush_rows`` is -1
+    padded.
     """
     batch = x.shape[0]
     if batch == 0:
@@ -439,12 +448,14 @@ def sketch_triton_decode(
     L = x_cache.shape[2]
     t = sketch.tables
     sketch_bc_pre(B, C, B_cache, write_pos, is_flush, bc_pre, slots, null_block_id)
+    query = sketch_query(C, sketch.frames_t)
+    window_keys = sketch_window_scratch(B, B_cache)
 
     block_k = max(16, triton.next_power_of_2(L))
     block_n = triton.next_power_of_2(dstate)
     common = (
         *x.stride(), dt.stride(0), dt.stride(1), dt_bias.stride(0), A.stride(0),
-        *B.stride(), *C.stride(), D.stride(0) if D is not None else 0,
+        *B.stride(), *query.stride(), D.stride(0) if D is not None else 0,
         *out.stride(), x_cache.stride(0), x_cache.stride(1), x_cache.stride(2),
         x_cache.stride(3), *dt_cache.stride(), *B_cache.stride(),
     )  # fmt: skip
@@ -452,7 +463,7 @@ def sketch_triton_decode(
     def nonflush() -> None:
         block_m = min(64, triton.next_power_of_2(dim))
         _sketch_decode_kernel[(triton.cdiv(dim, block_m), batch, heads)](
-            x, dt, dt_bias, A, B, C, D, out, x_cache, dt_cache, B_cache,
+            x, dt, dt_bias, A, B, query, D, out, x_cache, dt_cache, B_cache,
             bc_pre, write_pos, is_flush, slots, meta, sketch.u, sketch.w,
             sketch.ag, t.ranks, t.u_offsets, t.w_offsets, t.ag_offsets,
             null_block_id, dim, dstate, heads // B.shape[1], *common,
@@ -466,10 +477,13 @@ def sketch_triton_decode(
     def flush() -> None:
         block_m = min(32, triton.next_power_of_2(dim))
         programs = row_list_programs(batch, TRITON_ROWS_PER_PROGRAM)
+        sketch_window_keys(B, B_cache, write_pos, flush_rows, slots,
+                           sketch.frames_t, window_keys, null_block_id)  # fmt: skip
         _sketch_flush_kernel[(triton.cdiv(dim, block_m), programs, heads)](
-            state, x, dt, dt_bias, A, B, C, D, out, x_cache, dt_cache, B_cache,
-            write_pos, flush_rows, slots, null_block_id, batch, dim, dstate,
-            heads // B.shape[1], *state.stride(), *common,
+            state, x, dt, dt_bias, A, B, query, D, out, x_cache, dt_cache,
+            B_cache, window_keys, write_pos, flush_rows, slots, null_block_id,
+            batch, dim, dstate, heads // B.shape[1], *window_keys.stride()[:3],
+            *state.stride(), *common,
             DT_SOFTPLUS=True, HAS_D=D is not None, BLOCK_M=block_m,
             BLOCK_N=block_n, BLOCK_K=block_k,
             DOT_PRECISION=None if current_platform.is_rocm() else "tf32x3",

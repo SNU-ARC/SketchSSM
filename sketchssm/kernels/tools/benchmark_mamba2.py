@@ -43,14 +43,16 @@ MODES = ("standard", "replay", "sketch")
 def cuda_decode(state, x, dt, A, B, C, D, dt_bias, x_cache, dt_cache, B_cache,
                 bc_pre, write_pos, is_flush, flush_rows, slots, meta, out, sketch,
                 null_block_id=0, has_flush_rows=True):  # fmt: skip
-    """These kernels as vLLM runs them: ``bc_pre`` from vLLM's Triton kernel
-    and the flush on a side stream."""
+    """These kernels as vLLM runs them: ``bc_pre`` and the FP32 query from
+    vLLM's Triton kernels, and the flush on a side stream."""
     sk_ops.sketch_bc_pre(B, C, B_cache, write_pos, is_flush, bc_pre, slots,
                          null_block_id)  # fmt: skip
+    query = sk_ops.sketch_query(C, sketch.frames_t)
     skm.mamba2_decode(
-        state, x, dt, A, B, C, D, dt_bias, x_cache, dt_cache, B_cache, bc_pre,
+        state, x, dt, A, B, query, D, dt_bias, x_cache, dt_cache, B_cache, bc_pre,
         write_pos, is_flush, flush_rows, slots, meta, out, sketch, null_block_id,
-        has_flush_rows, flush_programs=sk_ops.row_list_programs(x.shape[0]),
+        has_flush_rows, frames_t=sketch.frames_t,
+        flush_programs=sk_ops.row_list_programs(x.shape[0]),
         run_with_flush=sk_ops.run_with_flush,
     )  # fmt: skip
 
@@ -101,8 +103,8 @@ def mamba2_step(mode, batch, args, layout):
 
 def mamba2_sketch_step(decode, batch, layout, state, x, dt, A, B, C, D, dt_bias,
                        rings, write_pos, is_flush, slots, out):  # fmt: skip
-    """SketchSSM as the model runs it: B/C rotation into the layer's frames,
-    key-major state and BF16 dt/D/dt_bias."""
+    """SketchSSM as the model runs it: the layer's frames, key-major state and
+    BF16 dt/D/dt_bias."""
     heads, dim, dstate = state.shape[1:]
     state = state.transpose(-1, -2).contiguous().transpose(-1, -2)
     ranks = layout.ranks.cpu()
@@ -110,7 +112,8 @@ def mamba2_sketch_step(decode, batch, layout, state, x, dt, A, B, C, D, dt_bias,
     buffers = (torch.zeros(batch, *s, dtype=d)
                for s, d in zip(shapes, sk_ops.SKETCH_DTYPES))  # fmt: skip
     sketch = sk_ops.SketchArgs(
-        *buffers, tables=sk_ops.SketchTables(ranks, dstate).cuda()
+        *buffers, tables=sk_ops.SketchTables(ranks, dstate).cuda(),
+        frames_t=layout.frames_t,
     )
     meta = torch.arange(batch, dtype=torch.int32)
     dt = dt[:, :, :1].bfloat16().expand(-1, -1, dim)
@@ -119,11 +122,8 @@ def mamba2_sketch_step(decode, batch, layout, state, x, dt, A, B, C, D, dt_bias,
     # A step with no flushing row skips the flush launch.
     has_flush_rows = bool(is_flush.any())
     flush_rows = flush_row_list(is_flush)
-    G, N = B.shape[1:]
-    B_flat, C_flat = B.view(batch, G * N), C.view(batch, G * N)
 
     def step():
-        sk_ops.sketch_rotate_(B_flat, C_flat, layout.frames_t)
         decode(
             state, x, dt, A, B, C, D, dt_bias, rings["x_cache"], rings["dt_cache"],
             rings["B_cache"], rings["bc_pre"], write_pos, is_flush, flush_rows,

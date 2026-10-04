@@ -4,8 +4,6 @@
         "NF_UBATCH": 1
     },
     "flush": {
-        "WARPS": 1,
-        "MINB": 9,
         "QREG": 0,
         "PREFETCH": 1,
         "UNROLL": 1,

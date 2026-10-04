@@ -3,7 +3,10 @@
 """SketchSSM for Mamba-2: sketch storage, B/C rotation and the sketch build.
 
 The state is kept key-major, ``(slot, head, dstate, dim)``, in coordinates
-rotated by a calibrated frame per group. Per request, a head of rank ``m``
+rotated by a calibrated frame R per group. Decode keeps B and C unrotated
+(the B ring holds the BF16 B as ReplaySSM does, ``bc_pre`` is B·C) and
+rotates in FP32 only what meets the rotated state: the query R·C and, at a
+flush, the window keys R·B_t. Per request, a head of rank ``m``
 (0 = dense) keeps ``u`` (its leading ``m`` state rows, all rows if dense),
 ``w`` (``min(m, 4)`` coefficient-map rows) and, for ``m > 4``, the FP32
 factors ``ag``. Sketch buffers are indexed by the persistent request index.
@@ -102,19 +105,25 @@ def _rotate_groups_kernel(
     stride_y_elem,
     N: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr = None,
 ):
-    # y[t, g] <- x[t, g] @ R_g^T.
+    # y[t, g, cols] <- x[t, g] @ R_g^T[:, cols] (BLOCK_C output columns).
     pid_t = tl.program_id(0)
     pid_g = tl.program_id(1)
     offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     offs_n = tl.arange(0, N)
+    if BLOCK_C is None:
+        offs_c = offs_n
+    else:
+        offs_c = tl.program_id(2) * BLOCK_C + tl.arange(0, BLOCK_C)
     mask = offs_t[:, None] < num_tokens
     cols = pid_g * N + offs_n[None, :]
     x = tl.load(
         x_ptr + offs_t[:, None] * stride_x_token + cols * stride_x_elem, mask, 0.0
     )
-    r = tl.load(frames_t_ptr + pid_g * N * N + offs_n[:, None] * N + offs_n[None, :])
+    r = tl.load(frames_t_ptr + pid_g * N * N + offs_n[:, None] * N + offs_c[None, :])
     y = tl.dot(x.to(tl.float32), r, input_precision="tf32x3")
+    cols = pid_g * N + offs_c[None, :]
     tl.store(
         y_ptr + offs_t[:, None] * stride_y_token + cols * stride_y_elem,
         y.to(y_ptr.dtype.element_ty),
@@ -147,11 +156,6 @@ def _rotate(B, C, frames_t, B_out, C_out):
         )  # fmt: skip
 
 
-def sketch_rotate_(B: torch.Tensor, C: torch.Tensor, frames_t: torch.Tensor):
-    """Rotate grouped B and C in place by the transposed ``frames_t``."""
-    _rotate(B, C, frames_t, B, C)
-
-
 def sketch_rotate(
     B: torch.Tensor, C: torch.Tensor, frames_t: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -160,6 +164,114 @@ def sketch_rotate(
     B_out, C_out = BC.split(B.shape[1], dim=1)
     _rotate(B, C, frames_t, B_out, C_out)
     return B_out, C_out
+
+
+def sketch_query(C: torch.Tensor, frames_t: torch.Tensor) -> torch.Tensor:
+    """FP32 rotated query R·C ``(batch, groups, dstate)`` of the decode C."""
+    batch, groups, n = C.shape
+    assert C.stride(1) == n * C.stride(2)
+    out = torch.empty(batch, groups, n, dtype=torch.float32, device=C.device)
+    if batch:
+        block_c = min(n, 64)
+        _rotate_groups_kernel[(triton.cdiv(batch, 32), groups, n // block_c)](
+            C, out, frames_t, batch, C.stride(0), C.stride(2), out.stride(0), 1,
+            n, 32, block_c, num_warps=4,
+        )  # fmt: skip
+    return out
+
+
+@triton.jit(do_not_specialize=["batch"])
+def _window_keys_kernel(
+    B_ptr,
+    B_cache_ptr,
+    frames_t_ptr,
+    out_ptr,
+    write_pos_ptr,
+    rows_ptr,
+    slots_ptr,
+    null_block_id,
+    batch,
+    stride_B_batch,
+    stride_B_group,
+    stride_B_cache_slot,
+    stride_B_cache_group,
+    stride_B_cache_pos,
+    stride_out_batch,
+    stride_out_group,
+    stride_out_pos,
+    W: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # out[row, g, t, cols] <- B_t @ R_g^T[:, cols] for t <= wp (ring rows,
+    # then the current B) of each row in ``rows`` (-1 padded).
+    pid_g = tl.program_id(1)
+    on = tl.arange(0, N)
+    oc = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
+    r = tl.load(frames_t_ptr + pid_g * N * N + on[:, None] * N + oc[None, :])
+    it = tl.program_id(0)
+    row = tl.load(rows_ptr + it, mask=it < batch, other=-1)
+    while row >= 0:
+        slot = tl.load(slots_ptr + row).to(tl.int64)
+        if slot != null_block_id:
+            wp = tl.load(write_pos_ptr + row).to(tl.int32)
+            ring = B_cache_ptr + slot * stride_B_cache_slot
+            ring += pid_g * stride_B_cache_group
+            dst = out_ptr + row.to(tl.int64) * stride_out_batch
+            dst += pid_g * stride_out_group
+            cur = tl.load(B_ptr + row.to(tl.int64) * stride_B_batch
+                          + pid_g * stride_B_group + on)  # fmt: skip
+            for t0 in tl.static_range(0, W, BLOCK_T):
+                if t0 <= wp:
+                    ot = t0 + tl.arange(0, BLOCK_T)
+                    keys = tl.load(
+                        ring + ot[:, None] * stride_B_cache_pos + on[None, :],
+                        mask=ot[:, None] < wp,
+                        other=0.0,
+                    )
+                    keys = tl.where(ot[:, None] == wp, cur[None, :], keys)
+                    y = tl.dot(keys.to(tl.float32), r, input_precision="tf32x3")
+                    tl.store(
+                        dst + ot[:, None] * stride_out_pos + oc[None, :],
+                        y,
+                        mask=ot[:, None] <= wp,
+                    )
+        it += tl.num_programs(0)
+        row = tl.load(rows_ptr + it, mask=it < batch, other=-1)
+
+
+def sketch_window_keys(
+    B: torch.Tensor,
+    B_cache: torch.Tensor,
+    write_pos: torch.Tensor,
+    flush_rows: torch.Tensor,
+    slots: torch.Tensor,
+    frames_t: torch.Tensor,
+    out: torch.Tensor,
+    null_block_id: int = NULL_BLOCK_ID,
+) -> None:
+    """FP32 rotated window keys ``out[row, group, t] = R B_t`` (t <= write_pos,
+    from the unrotated ring and the current B) of every flush row."""
+    batch, groups, n = B.shape
+    if batch == 0:
+        return
+    assert B.stride(2) == 1 and B_cache.stride(3) == 1 and out.stride(3) == 1
+    block_n = min(n, 64)
+    _window_keys_kernel[(row_list_programs(batch), groups, n // block_n)](
+        B, B_cache, frames_t, out, write_pos, flush_rows, slots, null_block_id,
+        batch, B.stride(0), B.stride(1), *B_cache.stride()[:3],
+        *out.stride()[:3], W=B_cache.shape[2], N=n, BLOCK_T=16,
+        BLOCK_N=block_n, num_warps=4,
+    )  # fmt: skip
+
+
+def sketch_window_scratch(B: torch.Tensor, B_cache: torch.Tensor) -> torch.Tensor:
+    """Per-step scratch of ``sketch_window_keys``: ``(batch, groups, W, N)``."""
+    batch, groups, n = B.shape
+    return torch.empty(
+        batch, groups, B_cache.shape[2], n, dtype=torch.float32, device=B.device
+    )
 
 
 @triton.jit
@@ -536,12 +648,13 @@ def sketch_bc_pre(
 
 @dataclass
 class SketchArgs:
-    """One layer's SketchSSM sketch and tables for the CUDA kernels."""
+    """One layer's SketchSSM sketch, tables and frames for the decode."""
 
     u: torch.Tensor  # (num_reqs, u_rows, head_dim) bf16
     w: torch.Tensor  # (num_reqs, w_rows, state_size) bf16
     ag: torch.Tensor  # (num_reqs, 5, ag_cols) fp32
     tables: SketchTables
+    frames_t: torch.Tensor  # (groups, state_size, state_size) fp32, R^T
 
 
 # Rows per program when a launch walks a row list.

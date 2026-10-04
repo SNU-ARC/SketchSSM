@@ -2,7 +2,5 @@
     "nf": {
         "NF_PF_ROWS": 0
     },
-    "flush": {
-        "MINB": 9
-    }
+    "flush": {}
 }

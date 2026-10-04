@@ -6,7 +6,5 @@
         "NF_PF_ROWS": 2,
         "NF_UROWS": 4
     },
-    "flush": {
-        "WARPS": 2
-    }
+    "flush": {}
 }

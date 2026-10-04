@@ -70,8 +70,10 @@ class Mamba2:
 
     def configure(self, configs):
         skm.tuned_config = lambda *shape: (configs["nf"], configs["flush"])
+        skm.large_batch_config = lambda *shape: None
         # A candidate that does not build must fail, not fall back.
         skm.window16_fallback = lambda *shape: False
+        skm._tuned_path = lambda *shape: self.name
         skm._nf_ext.cache_clear()
         skm._flush_ext.cache_clear()
 

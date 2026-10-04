@@ -138,13 +138,13 @@ struct NfStrides {
   long dt_b, dt_h;          // dt: row, head
   long bias_h, A_h, D_h;    // per-head scalars
   long B_b, B_g;            // B: row, group (key stride 1)
-  long C_b, C_g;            // C: row, group (key stride 1)
+  long C_b, C_g;            // C (the FP32 query): row, group (key stride 1)
   long o_b, o_h;            // out: row, head (value stride 1)
   long xc_b, xc_h, xc_k;    // x ring: slot, head, t (value stride 1)
   long dc_b, dc_h, dc_k;    // dt ring: slot, head, t
   long Bc_b, Bc_g, Bc_k;    // B ring: slot, group, t (key stride 1)
   long bc_b, bc_g, bc_k;    // bc_pre: row, group, t
-  long q_b, q_g;            // query: meta row, group (key stride 1)
+  long q_b, q_g;            // FP32 query (rotated C): row, group (key stride 1)
   long w_rows, sketch_rows, sm;
 };
 
@@ -288,13 +288,13 @@ static_assert(sizeof(NfShared) <= 48 * 1024,
 // sk_map[slot]; using b directly removes one dependent global round trip.
 extern "C" __global__ void __launch_bounds__(16 * NF_HEADS, NF_MINB)
 nf_kernel(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* __restrict__ Bias,
-          const float* __restrict__ A, const bf16* __restrict__ B, const bf16* __restrict__ C,
+          const float* __restrict__ A, const bf16* __restrict__ B, const float* __restrict__ C,
           const bf16* __restrict__ D, void* __restrict__ O, bf16* __restrict__ XR, float* __restrict__ DR,
           bf16* __restrict__ BR, const float* __restrict__ BC, const int* __restrict__ WP,
           const signed char* __restrict__ FL, const int* __restrict__ Slots, int null_slot,
           const int* __restrict__ NFH, const int* __restrict__ MH, const int* __restrict__ OFF,
           const int* __restrict__ Map, const uw_t* __restrict__ W, const float* __restrict__ AG,
-          const bf16* __restrict__ Q, const uw_t* __restrict__ U, const int* __restrict__ SkOff,
+          const float* __restrict__ Q, const uw_t* __restrict__ U, const int* __restrict__ SkOff,
           const int* __restrict__ WOff, NfStrides st_rt, int out_f32, int batch) {
 #if NF_CONST_STRIDES
   NfStrides st = NF_STRIDE_INIT;
@@ -337,7 +337,7 @@ nf_kernel(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* _
         if (sl == 2) pf_bulk(W + ((long)Map[bp] * st.w_rows + woff) * SK_N, (unsigned)min(m_h, 4) * (unsigned)SK_N * (unsigned)sizeof(uw_t));
         if (sl == 3) pf_bulk(DR + ps * st.dc_b + h * st.dc_h, 4u * SK_W);
 #if NF_PF_FULL
-        if (sl == 4) pf_bulk(Q + (long)bp * st.q_b + g * st.q_g, 2u * SK_N);
+        if (sl == 4) pf_bulk(Q + (long)bp * st.q_b + g * st.q_g, 4u * SK_N);
         if (sl == 5) pf_bulk(X + (long)bp * st.x_b + h * st.x_h, 2u * SK_P);
         if (sl == 6) pf_bulk(BC + (long)bp * st.bc_b + g * st.bc_g, 4u * SK_W);
         if (sl == 7) pf_l2(DT + (long)bp * st.dt_b + h * st.dt_h);
@@ -350,7 +350,7 @@ nf_kernel(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* _
         #pragma unroll
         for (int i = 0; i < (4 * SK_W + 127) / 128; ++i) pf_l2_if(DR + ps * st.dc_b + h * st.dc_h + 32 * i, sl == 0);
 #if NF_PF_FULL >= 1
-        pf_l2_if(Q + (long)bp * st.q_b + g * st.q_g + 64 * (sl & (SK_N / 64 - 1)), sl < SK_N / 64);
+        pf_l2_if(Q + (long)bp * st.q_b + g * st.q_g + 32 * (sl & (SK_N / 32 - 1)), sl < SK_N / 32);
 #endif
 #if NF_PF_FULL >= 2
         pf_l2_if(X + (long)bp * st.x_b + h * st.x_h, sl == 3);
@@ -380,20 +380,13 @@ nf_kernel(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* _
     #pragma unroll
     for (int j = 0; j < SK_WT; ++j) bcw[j] = bcp[16 * j];
   }
-  const bf16* qp = Q + b * st.q_b + g * st.q_g;
+  const float* qp = Q + b * st.q_b + g * st.q_g;
   // Lane sl owns keys j = SK_KPL*sl .. SK_KPL*sl+SK_KPL-1 of the query and of every map.
   float qv[SK_KPL];
   #pragma unroll
-  for (int k = 0; k < SK_KPL; k += 8) {
-#if SK_KPL == 4
-    const uint2 qr = *reinterpret_cast<const uint2*>(qp + SK_KPL * sl);
-    const unsigned qq[2] = {qr.x, qr.y};
-#else
-    const uint4 qr = *reinterpret_cast<const uint4*>(qp + SK_KPL * sl + k);
-    const unsigned qq[4] = {qr.x, qr.y, qr.z, qr.w};
-#endif
-    #pragma unroll
-    for (int i = 0; i < (SK_KPL < 8 ? SK_KPL : 8) / 2; ++i) { qv[k + 2 * i] = bf_lo(qq[i]); qv[k + 2 * i + 1] = bf_hi(qq[i]); }
+  for (int k = 0; k < SK_KPL; k += 4) {
+    const float4 qr = *reinterpret_cast<const float4*>(qp + SK_KPL * sl + k);
+    qv[k] = qr.x; qv[k + 1] = qr.y; qv[k + 2] = qr.z; qv[k + 3] = qr.w;
   }
   const uw_t* w = W + (di * st.w_rows + woff) * SK_N;
   #pragma unroll
@@ -682,14 +675,14 @@ nf_kernel(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* _
     for (int q = 0; q < SK_VPL / 2; ++q) { acc[2 * q] = ap[q].x; acc[2 * q + 1] = ap[q].y; }
   } else {
   // ---- coefficients (C only for dense heads; AG only for m > 4) -------------
-  const bf16* cp = C + b * st.C_b + g * st.C_g;
+  const float* cp = C + b * st.C_b + g * st.C_g;
   for (int n = sl; n < nrow; n += 16) {
-    float c = (n < nf_h) ? __bfloat162float(cp[n]) : 0.f;
+    float c = (n < nf_h) ? cp[n] : 0.f;
     if (n < m_h) {
       if (m_h <= 4) c += (n == 0 ? dots[0] : n == 1 ? dots[1] : n == 2 ? dots[2] : dots[3]);
       else {
         const long index = di * (5L * st.sm) + off_h + n;
-        c += fmaf(AG[index + st.sm], dots[0], AG[index] * __bfloat162float(qp[n]));
+        c += fmaf(AG[index + st.sm], dots[0], AG[index] * qp[n]);
         #pragma unroll
         for (int ip = 1; ip < 4; ++ip) c = fmaf(AG[index + (ip + 1) * st.sm], dots[ip], c);
       }
@@ -725,14 +718,14 @@ nf_kernel(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* _
   }
 #else
   // ---- coefficients (C only for dense heads; AG only for m > 4) -------------
-  const bf16* cp = C + b * st.C_b + g * st.C_g;
+  const float* cp = C + b * st.C_b + g * st.C_g;
   for (int n = sl; n < nrow; n += 16) {
-    float c = (n < nf_h) ? __bfloat162float(cp[n]) : 0.f;
+    float c = (n < nf_h) ? cp[n] : 0.f;
     if (n < m_h) {
       if (m_h <= 4) c += (n == 0 ? dots[0] : n == 1 ? dots[1] : n == 2 ? dots[2] : dots[3]);
       else {
         const long index = di * (5L * st.sm) + off_h + n;
-        c += fmaf(AG[index + st.sm], dots[0], AG[index] * __bfloat162float(qp[n]));
+        c += fmaf(AG[index + st.sm], dots[0], AG[index] * qp[n]);
         #pragma unroll
         for (int ip = 1; ip < 4; ++ip) c = fmaf(AG[index + (ip + 1) * st.sm], dots[ip], c);
       }
@@ -820,13 +813,13 @@ __device__ __forceinline__ void ld_uw8(const uw_t* p, float* v) {
 // values 8s..8s+7, keys 16s..16s+15 of the query/maps, window positions 2s, 2s+1.
 extern "C" __global__ void __launch_bounds__(8 * NF_HEADS, NF_MINB)
 nf_kernel8(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* __restrict__ Bias,
-           const float* __restrict__ A, const bf16* __restrict__ B, const bf16* __restrict__ C,
+           const float* __restrict__ A, const bf16* __restrict__ B, const float* __restrict__ C,
            const bf16* __restrict__ D, void* __restrict__ O, bf16* __restrict__ XR, float* __restrict__ DR,
            bf16* __restrict__ BR, const float* __restrict__ BC, const int* __restrict__ WP,
            const signed char* __restrict__ FL, const int* __restrict__ Slots, int null_slot,
            const int* __restrict__ NFH, const int* __restrict__ MH, const int* __restrict__ OFF,
            const int* __restrict__ Map, const uw_t* __restrict__ W, const float* __restrict__ AG,
-           const bf16* __restrict__ Q, const uw_t* __restrict__ U, const int* __restrict__ SkOff,
+           const float* __restrict__ Q, const uw_t* __restrict__ U, const int* __restrict__ SkOff,
            const int* __restrict__ WOff, NfStrides st_rt, int out_f32, int batch) {
 #if NF_CONST_STRIDES
   NfStrides st = NF_STRIDE_INIT;
@@ -872,7 +865,9 @@ nf_kernel8(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* 
 #if NF_PF_FULL
         if (s == 3) { pf_l2(X + (long)bp * st.x_b + h * st.x_h); pf_l2(DT + (long)bp * st.dt_b + h * st.dt_h); pf_l2(BC + (long)bp * st.bc_b + g * st.bc_g); }
         if (s == 1) pf_l2(Q + (long)bp * st.q_b + g * st.q_g);
-        if (s == 2) pf_l2(Q + (long)bp * st.q_b + g * st.q_g + 64);
+        if (s == 2) pf_l2(Q + (long)bp * st.q_b + g * st.q_g + 32);
+        if (s == 4) pf_l2(Q + (long)bp * st.q_b + g * st.q_g + 64);
+        if (s == 5) pf_l2(Q + (long)bp * st.q_b + g * st.q_g + 96);
 #endif
       }
     }
@@ -884,13 +879,12 @@ nf_kernel8(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* 
   const bf16* xp = X + b * st.x_b + h * st.x_h;
   const uint4 xraw = *reinterpret_cast<const uint4*>(xp + 8 * s);
   const float2 bc2 = *reinterpret_cast<const float2*>(BC + b * st.bc_b + g * st.bc_g + 2 * s);
-  const bf16* qp = Q + b * st.q_b + g * st.q_g;
+  const float* qp = Q + b * st.q_b + g * st.q_g;
   float qv[16];
-  {
-    const uint4 q0 = *reinterpret_cast<const uint4*>(qp + 16 * s), q1 = *reinterpret_cast<const uint4*>(qp + 16 * s + 8);
-    const unsigned qq[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) { qv[2 * i] = bf_lo(qq[i]); qv[2 * i + 1] = bf_hi(qq[i]); }
+  #pragma unroll
+  for (int k = 0; k < 16; k += 4) {
+    const float4 qr = *reinterpret_cast<const float4*>(qp + 16 * s + k);
+    qv[k] = qr.x; qv[k + 1] = qr.y; qv[k + 2] = qr.z; qv[k + 3] = qr.w;
   }
   const uw_t* w = W + (di * st.w_rows + woff) * 128;
   #pragma unroll
@@ -1023,14 +1017,14 @@ nf_kernel8(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* 
   } else {
     // ---- coefficients (C only for dense heads; AG only for m > 4); the ring is free now ----
     float* coef = reinterpret_cast<float*>(sh.ring[hs]);
-    const bf16* cp = C + b * st.C_b + g * st.C_g;
+    const float* cp = C + b * st.C_b + g * st.C_g;
     for (int n = s; n < nrow; n += 8) {
-      float c = (n < nf_h) ? __bfloat162float(cp[n]) : 0.f;
+      float c = (n < nf_h) ? cp[n] : 0.f;
       if (n < m_h) {
         if (m_h <= 4) c += (n == 0 ? dots[0] : n == 1 ? dots[1] : n == 2 ? dots[2] : dots[3]);
         else {
           const long index = di * (5L * st.sm) + off_h + n;
-          c += fmaf(AG[index + st.sm], dots[0], AG[index] * __bfloat162float(qp[n]));
+          c += fmaf(AG[index + st.sm], dots[0], AG[index] * qp[n]);
           #pragma unroll
           for (int ip = 1; ip < 4; ++ip) c = fmaf(AG[index + (ip + 1) * st.sm], dots[ip], c);
         }
@@ -1089,13 +1083,13 @@ nf_kernel8(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* 
 #if NF_ROWS > 1
 extern "C" __global__ void __launch_bounds__(16 * NF_HEADS, NF_MINB)
 nf_kernel_rows(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf16* __restrict__ Bias,
-               const float* __restrict__ A, const bf16* __restrict__ B, const bf16* __restrict__ C,
+               const float* __restrict__ A, const bf16* __restrict__ B, const float* __restrict__ C,
                const bf16* __restrict__ D, void* __restrict__ O, bf16* __restrict__ XR, float* __restrict__ DR,
                bf16* __restrict__ BR, const float* __restrict__ BC, const int* __restrict__ WP,
                const signed char* __restrict__ FL, const int* __restrict__ Slots, int null_slot,
                const int* __restrict__ NFH, const int* __restrict__ MH, const int* __restrict__ OFF,
                const int* __restrict__ Map, const uw_t* __restrict__ W, const float* __restrict__ AG,
-               const bf16* __restrict__ Q, const uw_t* __restrict__ U, const int* __restrict__ SkOff,
+               const float* __restrict__ Q, const uw_t* __restrict__ U, const int* __restrict__ SkOff,
                const int* __restrict__ WOff, NfStrides st_rt, int out_f32, int batch) {
 #if NF_CONST_STRIDES
   NfStrides st = NF_STRIDE_INIT;
@@ -1150,15 +1144,13 @@ nf_kernel_rows(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf
     float dt_cur = 0.f; uint2 xraw = make_uint2(0u, 0u); float bcw = 0.f; float qv[8]; float4 ur[NF_UROWS];
     const uw_t* w = W + (di * st.w_rows + woff) * 128;
     const uw_t* up = U + (di * st.sketch_rows + skoff) * 64;
-    const bf16* qp = Q + b * st.q_b + g * st.q_g;
+    const float* qp = Q + b * st.q_b + g * st.q_g;
     if (row_active) {
       dt_cur = __bfloat162float(DT[b * st.dt_b + h * st.dt_h]) + bias;
       xraw = *reinterpret_cast<const uint2*>(X + b * st.x_b + h * st.x_h + 4 * sl);
       bcw = BC[b * st.bc_b + g * st.bc_g + sl];
-      const uint4 qr = *reinterpret_cast<const uint4*>(qp + 8 * sl);
-      const unsigned qq[4] = {qr.x, qr.y, qr.z, qr.w};
-      #pragma unroll
-      for (int i = 0; i < 4; ++i) { qv[2 * i] = bf_lo(qq[i]); qv[2 * i + 1] = bf_hi(qq[i]); }
+      const float4 q0 = *reinterpret_cast<const float4*>(qp + 8 * sl), q1 = *reinterpret_cast<const float4*>(qp + 8 * sl + 4);
+      qv[0] = q0.x; qv[1] = q0.y; qv[2] = q0.z; qv[3] = q0.w; qv[4] = q1.x; qv[5] = q1.y; qv[6] = q1.z; qv[7] = q1.w;
       #pragma unroll
       for (int ip = 0; ip < NF_SMAPS; ++ip) {
         if (m_h > ip) {
@@ -1264,14 +1256,14 @@ nf_kernel_rows(const bf16* __restrict__ X, const bf16* __restrict__ DT, const bf
       }
       acc[0] = a01.x; acc[1] = a01.y; acc[2] = a23.x; acc[3] = a23.y;
     } else {
-      const bf16* cp = C + b * st.C_b + g * st.C_g;
+      const float* cp = C + b * st.C_b + g * st.C_g;
       for (int n = sl; n < nrow; n += 16) {
-        float c = (n < nf_h) ? __bfloat162float(cp[n]) : 0.f;
+        float c = (n < nf_h) ? cp[n] : 0.f;
         if (n < m_h) {
           if (m_h <= 4) c += (n == 0 ? dots[0] : n == 1 ? dots[1] : n == 2 ? dots[2] : dots[3]);
           else {
             const long index = di * (5L * st.sm) + off_h + n;
-            c += fmaf(AG[index + st.sm], dots[0], AG[index] * __bfloat162float(qp[n]));
+            c += fmaf(AG[index + st.sm], dots[0], AG[index] * qp[n]);
             #pragma unroll
             for (int ip = 1; ip < 4; ++ip) c = fmaf(AG[index + (ip + 1) * st.sm], dots[ip], c);
           }
