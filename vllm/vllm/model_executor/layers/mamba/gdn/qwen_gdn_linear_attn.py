@@ -30,7 +30,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.gdn.gdn_sketchssm import GDNSketchSSM
+from vllm.model_executor.layers.mamba.gdn.gdn_sketchssm import (
+    GDNOfficialReplaySSM,
+    GDNSketchSSM,
+)
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
@@ -418,7 +421,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
-        self.sketchssm: GDNSketchSSM | None = None
+        self.sketchssm: GDNSketchSSM | GDNOfficialReplaySSM | None = None
         if vllm_config.cache_config.uses_gdn_sketchssm:
             if gqa_interleaved_layout:
                 raise ValueError("SketchSSM requires the non-interleaved GDN layout")
@@ -1445,6 +1448,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         else:
             mixed_qkv_non_spec = None
+        if mixed_qkv_non_spec is not None:
+            self._rotate_qk(mixed_qkv_non_spec)
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
@@ -1582,9 +1587,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert prefill_has_initial_state is not None
             initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
-            if self.sketchssm is not None:
-                # The prefill runs in the model's key coordinates.
-                self.sketchssm.unrotate_state(initial_state)
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1602,9 +1604,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
             )
             # Init cache
-            if self.sketchssm is not None:
-                last_recurrent_state = last_recurrent_state.to(torch.float32)
-                self.sketchssm.rotate_state(last_recurrent_state)
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
             if self.sketchssm is not None:
                 self.sketchssm.prefilled(
@@ -1749,6 +1748,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.head_k_dim**-0.5,
         )
 
+    def _rotate_qk(self, mixed_qkv: torch.Tensor) -> None:
+        """Rotate the packed q and k blocks into the sketch coordinates."""
+        if self.sketchssm is not None:
+            self.sketchssm.rotate_(mixed_qkv)
+
     def _forward_core_decode_non_spec(
         self,
         mixed_qkv: torch.Tensor,
@@ -1789,6 +1793,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             validate_data=False,
         )
+        self._rotate_qk(mixed_qkv_non_spec)
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         if sketchssm:
             self._sketchssm_decode(

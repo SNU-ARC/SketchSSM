@@ -37,9 +37,6 @@ class GDNTables(Protocol):
     layout: torch.Tensor
     rank_cap: int
     window: int
-    # Optional: False when no head has a rank 0 < m < K (no coefficient maps to
-    # rebuild, e.g. ReplaySSM); the flush then skips its finish launch.
-    # has_sketch_heads: bool
 
 
 class GDNSketch(Protocol):
@@ -48,7 +45,9 @@ class GDNSketch(Protocol):
     u: torch.Tensor
     phi: torch.Tensor
     fs: torch.Tensor
-    beta: torch.Tensor  # (reqs, HV, W) FP32
+    beta: torch.Tensor
+    current_d: torch.Tensor
+    current_k: torch.Tensor
     tables: GDNTables
 
 

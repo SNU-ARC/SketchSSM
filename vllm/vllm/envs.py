@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_SKETCHSSM_USE_CUDA: bool = True
+    VLLM_GDN_REPLAYSSM_KERNEL: Literal["official", "sketchssm"] = "official"
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
@@ -1167,6 +1168,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use the SketchSSM CUDA kernels where supported instead of Triton.
     "VLLM_SKETCHSSM_USE_CUDA": lambda: bool(
         int(os.getenv("VLLM_SKETCHSSM_USE_CUDA", "1"))
+    ),
+    # GDN --use-replayssm decode kernel: "official" = the ReplaySSM authors'
+    # Triton kernel (Johnny-Liou/ReplaySSM), "sketchssm" = the SketchSSM GDN
+    # kernels with every head dense (exact flush).
+    "VLLM_GDN_REPLAYSSM_KERNEL": env_with_choices(
+        "VLLM_GDN_REPLAYSSM_KERNEL", "official", ["official", "sketchssm"]
     ),
     # If set, monkey-patch triton.runtime.autotuner.Autotuner.run to skip
     # benchmarking and select the first valid config (walking past invalid

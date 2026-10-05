@@ -3242,7 +3242,8 @@ class VllmConfig:
             self.cache_config.use_kda_recoverssm = False
             if self.cache_config.sketchssm is not None:
                 raise ValueError("--use-replayssm and --sketchssm are exclusive")
-            self._check_sketchssm_kernels("--use-replayssm")
+            if not self.cache_config.gdn_official_replayssm:
+                self._check_sketchssm_kernels("--use-replayssm")
             return self
         if _uses_kda_replayssm(self.model_config, self.cache_config):
             self._validate_kda_replayssm()
@@ -3297,11 +3298,6 @@ class VllmConfig:
         elif self.mamba_config.backend != MambaBackendEnum.TRITON:
             raise ValueError(
                 "--use-replayssm requires --mamba-backend triton or flashinfer"
-            )
-        elif self.use_v2_model_runner:
-            raise ValueError(
-                "Triton ReplaySSM requires Model Runner V1; use "
-                "--mamba-backend flashinfer or Model Runner V1"
             )
         if (
             self.kv_transfer_config is not None

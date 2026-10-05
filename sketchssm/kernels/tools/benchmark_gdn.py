@@ -23,7 +23,7 @@ from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_common import (
     GDNSketchTables,
     gdn_rotation_from_frames,
     gdn_sketch_build,
-    gdn_sketch_qk,
+    gdn_sketch_rotate_,
 )
 from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_triton import (
     gdn_sketch_triton_decode,
@@ -63,9 +63,8 @@ def gdn_step(mode, batch, args, layout):
             ssm_state_indices=slots, use_qk_l2norm_in_kernel=True,
         )  # fmt: skip
     write_pos, is_flush = ring_phase(args, batch, dev)
-    # d ring: W BF16 rows + W fp16 flush rows; k ring: W raw keys + 2 W fp16 flush rows
-    d = torch.zeros(batch + 1, HV, 2 * w, V, device=dev, dtype=torch.bfloat16)
-    k = torch.zeros(batch + 1, H, 3 * w, K, device=dev, dtype=torch.bfloat16)
+    d = torch.zeros(batch + 1, HV, w, V, device=dev, dtype=torch.bfloat16)
+    k = torch.zeros(batch + 1, H, w, K, device=dev, dtype=torch.bfloat16)
     g = torch.zeros(batch + 1, HV, w, device=dev)
     tables = GDNSketchTables(layout.ranks, H, w)
     sketch = GDNSketchArgs.allocate(tables, batch)
@@ -73,17 +72,16 @@ def gdn_step(mode, batch, args, layout):
     rotation_t = gdn_rotation_from_frames(layout.frames)
     decode = skg.gdn_decode if mode == "sketch" else gdn_sketch_triton_decode
     gdn_sketch_build(state, torch.ones_like(slots), slots, meta, sketch)
-    flush_rows = flush_row_list(is_flush)
+    flush_rows = flush_row_list(is_flush, count_pad=True)
     has_flush_rows = bool(is_flush.any())
 
     def step():
-        # q and k stay unrotated; the decode takes their FP32 rotation
-        qk = gdn_sketch_qk(mixed, rotation_t)
+        gdn_sketch_rotate_(mixed, rotation_t)
         decode(
             **common, out=out.view(batch, HV, V), state=state, d_cache=d,
             k_cache=k, g_cache=g, slots=slots, write_pos=write_pos, meta=meta,
             flush_rows=flush_rows, sketch=sketch, scale=K**-0.5,
-            has_flush_rows=has_flush_rows, qk=qk,
+            has_flush_rows=has_flush_rows,
         )  # fmt: skip
 
     return step

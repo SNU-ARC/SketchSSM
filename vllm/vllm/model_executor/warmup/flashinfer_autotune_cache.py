@@ -36,7 +36,10 @@ def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
             / flashinfer_workspace.name
         )
 
-    output_dir = root / flashinfer_autotune_cache_hash(runner)
+    # Benchmarks comparing engine variants of one model can share one tuning
+    # result, so every variant runs the same GEMM/MoE tactics.
+    shared_key = os.environ.get("VLLM_FLASHINFER_AUTOTUNE_CACHE_KEY")
+    output_dir = root / (shared_key or flashinfer_autotune_cache_hash(runner))
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / "autotune_configs.json"
 

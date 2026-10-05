@@ -1,0 +1,208 @@
+{
+ "model": "super",
+ "layers": 40,
+ "scope": "Nemotron 3 Super (Mamba-2) on one B300, kernels only: all 40 recurrent layers with their own buffers and the calibration's ranks/frames at mean rank G, W=16. One CUDA graph per phase holds one decode step of every layer (every row at window position 5 = non-flush, no flush launch; or 15 = flush). Per layer = graph time / layers, median of 5 captures of 6 replays. (c) window = 15 non-flush + 1 flush; Standard = 16 full-state updates. control = the flush without the sketch and coefficient-map construction (timing only), G=4 in the hatch.",
+ "rows": [
+  {
+   "batch": 128,
+   "arm": "standard",
+   "phase": "window",
+   "ms_per_layer": 2.9978474617004394
+  },
+  {
+   "batch": 128,
+   "arm": "replayssm",
+   "phase": "nonflush",
+   "us_per_layer": 98.95053406556448
+  },
+  {
+   "batch": 128,
+   "arm": "replayssm",
+   "phase": "flush",
+   "us_per_layer": 238.74772787094116
+  },
+  {
+   "batch": 128,
+   "arm": "replayssm",
+   "phase": "window",
+   "ms_per_layer": 1.7230057388544084
+  },
+  {
+   "batch": 128,
+   "arm": "g8",
+   "phase": "nonflush",
+   "us_per_layer": 35.11839956045151
+  },
+  {
+   "batch": 128,
+   "arm": "g8",
+   "phase": "flush",
+   "us_per_layer": 270.05066871643066
+  },
+  {
+   "batch": 128,
+   "arm": "g8",
+   "phase": "window",
+   "ms_per_layer": 0.7968266621232033
+  },
+  {
+   "batch": 128,
+   "arm": "g4",
+   "phase": "nonflush",
+   "us_per_layer": 23.223866522312164
+  },
+  {
+   "batch": 128,
+   "arm": "g4",
+   "phase": "flush",
+   "us_per_layer": 264.2793377240499
+  },
+  {
+   "batch": 128,
+   "arm": "g4",
+   "phase": "window",
+   "ms_per_layer": 0.6126373355587323
+  },
+  {
+   "batch": 128,
+   "arm": "control",
+   "phase": "flush",
+   "us_per_layer": 212.38306363423666,
+   "control_g": 4
+  },
+  {
+   "batch": 256,
+   "arm": "standard",
+   "phase": "window",
+   "ms_per_layer": 6.4789674123128265
+  },
+  {
+   "batch": 256,
+   "arm": "replayssm",
+   "phase": "nonflush",
+   "us_per_layer": 189.21533226966858
+  },
+  {
+   "batch": 256,
+   "arm": "replayssm",
+   "phase": "flush",
+   "us_per_layer": 466.25413099924725
+  },
+  {
+   "batch": 256,
+   "arm": "replayssm",
+   "phase": "window",
+   "ms_per_layer": 3.304484115044276
+  },
+  {
+   "batch": 256,
+   "arm": "g8",
+   "phase": "nonflush",
+   "us_per_layer": 48.83840034405391
+  },
+  {
+   "batch": 256,
+   "arm": "g8",
+   "phase": "flush",
+   "us_per_layer": 459.0154727300008
+  },
+  {
+   "batch": 256,
+   "arm": "g8",
+   "phase": "window",
+   "ms_per_layer": 1.1915914778908094
+  },
+  {
+   "batch": 256,
+   "arm": "g4",
+   "phase": "nonflush",
+   "us_per_layer": 33.117467164993286
+  },
+  {
+   "batch": 256,
+   "arm": "g4",
+   "phase": "flush",
+   "us_per_layer": 447.6629177729289
+  },
+  {
+   "batch": 256,
+   "arm": "g4",
+   "phase": "window",
+   "ms_per_layer": 0.9444249252478283
+  },
+  {
+   "batch": 256,
+   "arm": "control",
+   "phase": "flush",
+   "us_per_layer": 367.7894632021586,
+   "control_g": 4
+  },
+  {
+   "batch": 512,
+   "arm": "standard",
+   "phase": "window",
+   "ms_per_layer": 14.700501251220704
+  },
+  {
+   "batch": 512,
+   "arm": "replayssm",
+   "phase": "nonflush",
+   "us_per_layer": 372.3890701929728
+  },
+  {
+   "batch": 512,
+   "arm": "replayssm",
+   "phase": "flush",
+   "us_per_layer": 926.9241174062093
+  },
+  {
+   "batch": 512,
+   "arm": "replayssm",
+   "phase": "window",
+   "ms_per_layer": 6.5127601703008
+  },
+  {
+   "batch": 512,
+   "arm": "g8",
+   "phase": "nonflush",
+   "us_per_layer": 75.4850665728251
+  },
+  {
+   "batch": 512,
+   "arm": "g8",
+   "phase": "flush",
+   "us_per_layer": 880.4786682128906
+  },
+  {
+   "batch": 512,
+   "arm": "g8",
+   "phase": "window",
+   "ms_per_layer": 2.012754666805267
+  },
+  {
+   "batch": 512,
+   "arm": "g4",
+   "phase": "nonflush",
+   "us_per_layer": 51.922133564949036
+  },
+  {
+   "batch": 512,
+   "arm": "g4",
+   "phase": "flush",
+   "us_per_layer": 856.2050501505533
+  },
+  {
+   "batch": 512,
+   "arm": "g4",
+   "phase": "window",
+   "ms_per_layer": 1.6350370536247887
+  },
+  {
+   "batch": 512,
+   "arm": "control",
+   "phase": "flush",
+   "us_per_layer": 711.8174632390339,
+   "control_g": 4
+  }
+ ]
+}

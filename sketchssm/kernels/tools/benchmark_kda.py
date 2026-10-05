@@ -80,7 +80,7 @@ def kda_step(mode, batch, args, layout):
     scratch = kda_sketch_scratch(batch, tables, dev)
     meta = torch.arange(batch, dtype=torch.int32, device=dev)
     build(state, rings, slots, meta, meta, sketch, scratch)
-    flush_rows = flush_row_list(is_flush)
+    flush_rows = flush_row_list(is_flush, count_pad=True)
     has_flush_rows = bool(is_flush.any())
     return lambda: decode(
         q.view(batch, H, K), k.view(batch, H, K), v.view(batch, H, V),

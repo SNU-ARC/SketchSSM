@@ -985,10 +985,8 @@ def sketch_decode_rows(
     common_attn_metadata: CommonAttentionMetadata,
     num_decodes: int,
     is_flush_cpu: torch.Tensor,
-    pad: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sketch rows of the decode rows, and the flush rows padded with ``pad``
-    (negative)."""
+    """Sketch rows of the decode rows, and the flush rows padded with -1."""
     # Padded decode rows read sketch row 0.
     req_idx = _sketch_req_idx(common_attn_metadata)
     meta = [0] * num_decodes
@@ -999,7 +997,7 @@ def sketch_decode_rows(
     return (
         async_tensor_h2d(meta, dtype=torch.int32, device=device),
         async_tensor_h2d(
-            flush_rows + [pad] * (num_decodes - len(flush_rows)),
+            flush_rows + [-1] * (num_decodes - len(flush_rows)),
             dtype=torch.int32,
             device=device,
         ),

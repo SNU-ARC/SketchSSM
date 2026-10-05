@@ -5,6 +5,6 @@
         "S8_PREFETCH": 0
     },
     "flush": {
-        "K1_MINB": 3
+        "K1_MINB": 2
     }
 }

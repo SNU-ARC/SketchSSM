@@ -32,7 +32,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 logger = init_logger(__name__)
 
-SKETCHSSM_KERNELS_API = 4
+SKETCHSSM_KERNELS_API = 3
 
 
 @functools.cache
@@ -190,14 +190,12 @@ def gdn_cuda_decode(
     scale: float,
     null_block_id: int = NULL_BLOCK_ID,
     has_flush_rows: bool = True,
-    *,
-    qk: torch.Tensor | None = None,
 ) -> None:
     """Same arguments and results as ``gdn_sketch_triton_decode``."""
     _kernels().gdn_decode(
         mixed_qkv, a, b, A_log, dt_bias, out, state, d_cache, k_cache, g_cache,
         slots, write_pos, meta, flush_rows, sketch, scale, null_block_id,
-        has_flush_rows, qk=qk,
+        has_flush_rows,
     )  # fmt: skip
 
 

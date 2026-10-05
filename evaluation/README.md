@@ -12,6 +12,7 @@ with the calibration `SketchSSM/Nemotron-Nano-9B-v2-BF16` (`--model`,
 | `accuracy.py` | IFEval, MATH-500, HumanEval and MBPP accuracy as avg@K (lm-eval 0.4.12) |
 | `throughput.py` | decode throughput on synthetic prompts at chosen batch sizes |
 | `linear_attention.py` | per-layer recurrent (linear-attention) decode latency, by kernel (Nsight Systems) |
+| `b300/` | Figures 7 and 8 on one B300: per-layer linear-attention kernel latency of Super, Qwen and GLM, and Super end-to-end decode throughput and breakdown (scripts, results, data, figures; see `b300/README.md`) |
 
 SketchSSM runs on vLLM's Model Runner V2 and the Triton ReplaySSM on Model
 Runner V1; the scripts select the runner per arm, and Standard uses V2.

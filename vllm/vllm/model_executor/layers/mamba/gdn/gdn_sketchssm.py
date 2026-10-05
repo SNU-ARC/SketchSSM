@@ -6,10 +6,6 @@ Dense heads (rank 0) of a calibration keep BF16 rows of their full state,
 read on non-flush steps. ``--use-replayssm`` runs the same kernels with every
 head dense, without those rows (the FP32 state is read at every step) and no
 rotation: the exact window replay of ReplaySSM, without a calibration.
-
-q and k stay unrotated in the activations. Decode rotates them in FP32 where
-they meet the rotated state or sketch; prefill runs on the unrotated state
-(``unrotate_state`` before, ``rotate_state`` after).
 """
 
 from typing import TYPE_CHECKING
@@ -23,9 +19,8 @@ from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_common import (
     GDNSketchTables,
     gdn_rotation_from_frames,
     gdn_sketch_build,
-    gdn_sketch_qk,
+    gdn_sketch_rotate_,
     gdn_sketch_window_supported,
-    gdn_state_rotate,
 )
 from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_triton import (
     gdn_sketch_triton_decode,
@@ -35,9 +30,76 @@ from vllm.model_executor.layers.mamba.ops.sketchssm_kernels import (
     gdn_cuda_supported,
 )
 from vllm.model_executor.layers.mamba.sketchssm import load_sketchssm_calibration
+from vllm.third_party.flash_linear_attention.ops import (
+    fused_recurrent_gated_delta_rule_replayssm,
+)
 
 if TYPE_CHECKING:
     from vllm.config import CacheConfig
+
+
+class GDNOfficialReplaySSM(torch.nn.Module):
+    """GDN ReplaySSM with the authors' Triton decode kernel
+    (Johnny-Liou/ReplaySSM ``fused_recurrent_gated_delta_rule_replayssm``):
+    the FP32 state is the window checkpoint, read at every step and written
+    on the flush step; the rings hold the window's ``d``, ``k`` and ``g``.
+    Same interface as ``GDNSketchSSM`` (no frames, nothing built after a
+    prefill)."""
+
+    def __init__(self, window: int):
+        super().__init__()
+        self.window = window
+
+    rotation_t = None
+
+    def rotate_(self, mixed_qkv: torch.Tensor) -> None:
+        pass
+
+    def unrotate_state(self, state: torch.Tensor) -> None:
+        pass
+
+    def rotate_state(self, state: torch.Tensor) -> None:
+        pass
+
+    def prefilled(self, state, attn_metadata, state_indices) -> None:
+        pass
+
+    def decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        out: torch.Tensor,
+        state: torch.Tensor,
+        d_cache: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
+        attn_metadata,
+        state_indices: torch.Tensor,
+        scale: float,
+    ) -> None:
+        write_pos = attn_metadata.sketchssm_window_pos_d
+        if state_indices.ndim > 1:
+            state_indices = state_indices[:, 0]
+        fused_recurrent_gated_delta_rule_replayssm(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=state,
+            d_cache=d_cache,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            out=out,
+            ssm_state_indices=state_indices,
+            write_pos=write_pos,
+            is_flush=(write_pos == self.window - 1).to(torch.int8),
+            use_qk_l2norm_in_kernel=True,
+        )
 
 
 class GDNSketchSSM(torch.nn.Module):
@@ -99,17 +161,10 @@ class GDNSketchSSM(torch.nn.Module):
         )
         self.sketch = GDNSketchArgs.allocate(self.tables, max_num_reqs, device)
 
-    def unrotate_state(self, state: torch.Tensor) -> None:
-        """Rotate FP32 states ``(rows, HV, V, K)`` back to the model's key
-        coordinates in place (before a prefill continues from them)."""
+    def rotate_(self, mixed_qkv: torch.Tensor) -> None:
+        """Rotate q and k of ``mixed_qkv (tokens, 2 H K + HV V)`` in place."""
         if self.rotation_t is not None:
-            gdn_state_rotate(state, self.rotation_t, inverse=True)
-
-    def rotate_state(self, state: torch.Tensor) -> None:
-        """Rotate FP32 states ``(rows, HV, V, K)`` into the sketch's key frame
-        in place (after a prefill)."""
-        if self.rotation_t is not None:
-            gdn_state_rotate(state, self.rotation_t)
+            gdn_sketch_rotate_(mixed_qkv, self.rotation_t)
 
     def prefilled(
         self, state: torch.Tensor, attn_metadata, state_indices: torch.Tensor
@@ -136,16 +191,12 @@ class GDNSketchSSM(torch.nn.Module):
         state_indices: torch.Tensor,
         scale: float,
     ) -> None:
-        """One decode step (q/k of ``mixed_qkv`` unrotated); rows at the end
-        of their window are flushed."""
-        qk = None
-        if self.rotation_t is not None:
-            qk = gdn_sketch_qk(mixed_qkv, self.rotation_t)
+        """One decode step; rows at the end of their window are flushed."""
         self._decode(
             mixed_qkv, a, b, A_log, dt_bias, out, state, d_cache, k_cache,
             g_cache, state_indices, attn_metadata.sketchssm_window_pos_d,
             attn_metadata.sketch_meta_d, attn_metadata.sketch_flush_rows_d,
-            self.sketch, scale, qk=qk,
+            self.sketch, scale,
         )  # fmt: skip
 
     @classmethod
@@ -161,11 +212,13 @@ class GDNSketchSSM(torch.nn.Module):
         max_num_reqs: int,
         activation_dtype: torch.dtype,
         state_dtype: torch.dtype,
-    ) -> "GDNSketchSSM | None":
+    ) -> "GDNSketchSSM | GDNOfficialReplaySSM | None":
         """The layer's SketchSSM when ``--sketchssm`` is set, or its dense
         ReplaySSM for ``--use-replayssm``."""
         if cache_config is None or not cache_config.uses_gdn_sketchssm:
             return None
+        if cache_config.gdn_official_replayssm:
+            return GDNOfficialReplaySSM(cache_config.replayssm_buffer_len)
         if cache_config.sketchssm is None:
             ranks, frames = torch.zeros(num_v_heads, dtype=torch.int32), None
         else:

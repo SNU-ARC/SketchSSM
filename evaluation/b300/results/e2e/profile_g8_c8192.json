@@ -1,0 +1,75 @@
+{
+ "arm": "g8",
+ "context": 8192,
+ "batch": 512,
+ "layers": 40,
+ "per_step": {
+  "n": 96,
+  "recurrent_us": 5635.30946875,
+  "recurrent_per_layer_us": 140.88273671874998,
+  "components_per_layer_us": {
+   "readout": 69.51549166666666,
+   "flush": 60.803002864583334,
+   "finish": 0.0,
+   "input copy": 0.0,
+   "shared B/C": 4.9518171875,
+   "basis transform": 5.612425
+  },
+  "categories_us": {
+   "GEMM": 13200.0025625,
+   "Linear attention": 5635.30946875,
+   "Softmax attention": 2637.343552083333,
+   "Others": 3586.730697916667
+  },
+  "kernel_sum_us": 25059.38628125,
+  "span_us": 26741.163614583333,
+  "range_us": 2010.5192708333334
+ },
+ "nonflush": {
+  "n": 90,
+  "recurrent_us": 3591.2366444444447,
+  "recurrent_per_layer_us": 89.78091611111111,
+  "components_per_layer_us": {
+   "readout": 72.3729613888889,
+   "flush": 6.716531944444446,
+   "finish": 0.0,
+   "input copy": 0.0,
+   "shared B/C": 5.083152777777777,
+   "basis transform": 5.60827
+  },
+  "categories_us": {
+   "GEMM": 13184.417055555556,
+   "Linear attention": 3591.2366444444447,
+   "Softmax attention": 2636.0376,
+   "Others": 3585.610955555556
+  },
+  "kernel_sum_us": 22997.302255555554,
+  "span_us": 24742.779444444444,
+  "range_us": 2009.5089222222223
+ },
+ "flush": {
+  "n": 6,
+  "recurrent_us": 36296.40183333334,
+  "recurrent_per_layer_us": 907.4100458333335,
+  "components_per_layer_us": {
+   "readout": 26.653445833333336,
+   "flush": 872.1000666666666,
+   "finish": 0.0,
+   "input copy": 0.0,
+   "shared B/C": 2.981783333333333,
+   "basis transform": 5.67475
+  },
+  "categories_us": {
+   "GEMM": 13433.785166666667,
+   "Linear attention": 36296.40183333333,
+   "Softmax attention": 2656.9328333333333,
+   "Others": 3603.5268333333333
+  },
+  "kernel_sum_us": 55990.64666666667,
+  "span_us": 56716.92616666667,
+  "range_us": 2025.6745
+ },
+ "window": {
+  "recurrent_per_layer_us": 2254.1237875
+ }
+}

@@ -1,0 +1,161 @@
+{
+ "scope": "Nemotron 3 Super on one B300, Figure 8 settings (default KV layout, Model Runner V2, shared FlashInfer autotune, B300 selective_state_update config, max_model_len = C + 128). One nsys-profiled cohort per row (max_num_seqs = B); step = GPU span of a decode step over steps 16-111; Others = the rest of the span; tokens_per_s = batch / step.",
+ "rows": [
+  {
+   "context": 2048,
+   "batch": 256,
+   "arm": "replayssm",
+   "step_ms": 23.2394575625,
+   "components_ms": {
+    "GEMM": 10.713525677083332,
+    "Linear attention": 8.371456020833334,
+    "Softmax attention": 0.42700104166666664,
+    "Others": 3.727474822916669
+   },
+   "tokens_per_s": 11015.747648649534
+  },
+  {
+   "context": 2048,
+   "batch": 256,
+   "arm": "standard",
+   "step_ms": 31.85857459375,
+   "components_ms": {
+    "GEMM": 11.153651041666667,
+    "Linear attention": 17.052478864583332,
+    "Softmax attention": 0.46992740625,
+    "Others": 3.18251728125
+   },
+   "tokens_per_s": 8035.513304170927
+  },
+  {
+   "context": 2048,
+   "batch": 512,
+   "arm": "replayssm",
+   "step_ms": 35.8947936875,
+   "components_ms": {
+    "GEMM": 13.636542739583334,
+    "Linear attention": 16.564685270833333,
+    "Softmax attention": 0.7511293333333333,
+    "Others": 4.942436343749996
+   },
+   "tokens_per_s": 14263.907029455886
+  },
+  {
+   "context": 2048,
+   "batch": 512,
+   "arm": "standard",
+   "step_ms": 59.74812989583334,
+   "components_ms": {
+    "GEMM": 13.72964109375,
+    "Linear attention": 40.90974872916667,
+    "Softmax attention": 0.8153453020833333,
+    "Others": 4.293394770833331
+   },
+   "tokens_per_s": 8569.305866018502
+  },
+  {
+   "context": 2048,
+   "batch": 872,
+   "arm": "replayssm",
+   "step_ms": 53.2313065625,
+   "components_ms": {
+    "GEMM": 17.413564750000003,
+    "Linear attention": 28.16020841666667,
+    "Softmax attention": 1.2343211770833333,
+    "Others": 6.423212218749995
+   },
+   "tokens_per_s": 16381.337530691011
+  },
+  {
+   "context": 2048,
+   "batch": 872,
+   "arm": "standard",
+   "step_ms": 97.75406533333333,
+   "components_ms": {
+    "GEMM": 17.210266385416666,
+    "Linear attention": 73.49688658333334,
+    "Softmax attention": 1.323608375,
+    "Others": 5.723303989583329
+   },
+   "tokens_per_s": 8920.34512351534
+  },
+  {
+   "context": 8192,
+   "batch": 256,
+   "arm": "replayssm",
+   "step_ms": 23.36197869791667,
+   "components_ms": {
+    "GEMM": 9.886005854166665,
+    "Linear attention": 8.371710927083333,
+    "Softmax attention": 1.36778715625,
+    "Others": 3.7364747604166695
+   },
+   "tokens_per_s": 10957.97591934407
+  },
+  {
+   "context": 8192,
+   "batch": 256,
+   "arm": "standard",
+   "step_ms": 31.846069791666665,
+   "components_ms": {
+    "GEMM": 10.160980770833334,
+    "Linear attention": 17.0513526875,
+    "Softmax attention": 1.42308325,
+    "Others": 3.21065308333333
+   },
+   "tokens_per_s": 8038.668560193538
+  },
+  {
+   "context": 8192,
+   "batch": 512,
+   "arm": "replayssm",
+   "step_ms": 37.30938079166667,
+   "components_ms": {
+    "GEMM": 13.128461802083333,
+    "Linear attention": 16.581587927083334,
+    "Softmax attention": 2.635037854166667,
+    "Others": 4.964293208333338
+   },
+   "tokens_per_s": 13723.090256013014
+  },
+  {
+   "context": 8192,
+   "batch": 512,
+   "arm": "standard",
+   "step_ms": 61.295803479166665,
+   "components_ms": {
+    "GEMM": 13.243056291666665,
+    "Linear attention": 41.099291718749996,
+    "Softmax attention": 2.6676877604166664,
+    "Others": 4.2857677083333385
+   },
+   "tokens_per_s": 8352.937247555936
+  },
+  {
+   "context": 8192,
+   "batch": 872,
+   "arm": "replayssm",
+   "step_ms": 56.055253354166666,
+   "components_ms": {
+    "GEMM": 17.187051510416666,
+    "Linear attention": 28.175379729166668,
+    "Softmax attention": 4.361235375000001,
+    "Others": 6.331586739583329
+   },
+   "tokens_per_s": 15556.079900139868
+  },
+  {
+   "context": 8192,
+   "batch": 872,
+   "arm": "standard",
+   "step_ms": 100.39266856249999,
+   "components_ms": {
+    "GEMM": 17.019227208333334,
+    "Linear attention": 73.24628471875,
+    "Softmax attention": 4.467693677083334,
+    "Others": 5.659462958333322
+   },
+   "tokens_per_s": 8685.893227921635
+  }
+ ]
+}

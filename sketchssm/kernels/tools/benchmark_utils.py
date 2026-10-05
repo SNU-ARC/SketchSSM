@@ -34,9 +34,12 @@ def ring_phase(args, batch, dev):
     return phase.to(torch.int32).to(dev), (phase == w - 1).to(torch.int8).to(dev)
 
 
-def flush_row_list(is_flush: torch.Tensor) -> torch.Tensor:
-    """``(batch,)`` int32 indices of the flush rows, then -1 padding."""
-    rows = torch.full_like(is_flush, -1, dtype=torch.int32)
+def flush_row_list(is_flush: torch.Tensor, count_pad: bool = False) -> torch.Tensor:
+    """``(batch,)`` int32 indices of the flush rows, then padding: -1, or with
+    ``count_pad`` -2 - n (n flush rows), the GDN/KDA convention of the vLLM
+    metadata builders (the flush reads n from it to spread few rows over CTAs)."""
+    n = int(is_flush.sum())
+    rows = torch.full_like(is_flush, -2 - n if count_pad else -1, dtype=torch.int32)
     idx = torch.nonzero(is_flush).flatten()
     rows[: idx.numel()] = idx.to(torch.int32)
     return rows

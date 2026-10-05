@@ -297,6 +297,7 @@ class MambaHybridModelState(DefaultModelState):
         replayssm_decode_base_cpu = None
         if (
             self.cache_config.sketchssm is not None
+            or self.cache_config.use_replayssm
             or self.cache_config.use_gdn_replayssm
         ):
             # Padding rows get a zero origin. prefill_len includes output

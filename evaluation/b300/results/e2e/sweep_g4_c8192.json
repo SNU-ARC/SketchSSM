@@ -1,0 +1,262 @@
+{
+ "model": "super",
+ "arm": "sketch",
+ "g": 4.0,
+ "calibration": "SketchSSM/Nemotron-3-Super-NVFP4",
+ "context": 8192,
+ "tokens": 128,
+ "util": 0.95,
+ "seed": 20261005,
+ "capacity": {
+  "num_blocks": 5121,
+  "blocks_per_request": 6,
+  "block_pool_upper_bound": 853,
+  "max_concurrency_reported": null,
+  "groups": [
+   {
+    "kind": "MambaSpec",
+    "layers": 8,
+    "block_size": 8320,
+    "page_size_bytes": 4562944,
+    "blocks_per_request": 1
+   },
+   {
+    "kind": "MambaSpec",
+    "layers": 8,
+    "block_size": 8320,
+    "page_size_bytes": 4562944,
+    "blocks_per_request": 1
+   },
+   {
+    "kind": "MambaSpec",
+    "layers": 8,
+    "block_size": 8320,
+    "page_size_bytes": 4562944,
+    "blocks_per_request": 1
+   },
+   {
+    "kind": "MambaSpec",
+    "layers": 8,
+    "block_size": 8320,
+    "page_size_bytes": 4562944,
+    "blocks_per_request": 1
+   },
+   {
+    "kind": "MambaSpec",
+    "layers": 8,
+    "block_size": 8320,
+    "page_size_bytes": 4562944,
+    "blocks_per_request": 1
+   },
+   {
+    "kind": "FullAttentionSpec",
+    "layers": 8,
+    "block_size": 8912,
+    "page_size_bytes": 4562944,
+    "blocks_per_request": 1
+   }
+  ],
+  "runner": "vllm.v1.worker.gpu.model_runner",
+  "free_gib": 13.60107421875
+ },
+ "llm_kwargs": {
+  "model": "/disk2/models/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+  "trust_remote_code": true,
+  "mamba_ssm_cache_dtype": "float32",
+  "gpu_memory_utilization": 0.95,
+  "enable_prefix_caching": false,
+  "max_model_len": 8320,
+  "max_num_batched_tokens": 8192,
+  "max_num_seqs": 856,
+  "scheduler_cls": "barrier.BarrierScheduler",
+  "disable_log_stats": true,
+  "sketchssm": "SketchSSM/Nemotron-3-Super-NVFP4",
+  "sketchssm_mean_rank": 4.0,
+  "replayssm_buffer_len": 16
+ },
+ "batches": [
+  1,
+  128,
+  256,
+  512,
+  848
+ ],
+ "prompt_sha256": "2fb0907858a6f998f3f06f07501061534598054c1ea2344fad734ceeedda195b",
+ "env": {
+  "SKETCHSSM_KERNELS_CACHE_DIR": "/disk2/omin/.cache/sketchssm_0111",
+  "SKETCHSSM_KERNELS_DISABLE_AOT": "1",
+  "VLLM_TUNED_CONFIG_FOLDER": "/disk2/omin/wt-0111/evaluation/b300/configs/selective_state_update",
+  "VLLM_FLASHINFER_AUTOTUNE_CACHE_KEY": "super-fig8-b300",
+  "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+  "VLLM_USE_V2_MODEL_RUNNER": "1"
+ },
+ "summaries": [
+  {
+   "batch": 1,
+   "repeat": 0,
+   "steps": 127,
+   "steady_steps": 96,
+   "model_forward_ms_per_step": 6.072708681225777,
+   "wall_ms_per_step": 6.40976987498713,
+   "tokens_per_s_forward": 164.67116281924953,
+   "tokens_per_s_wall": 156.011841221056,
+   "wave_s": 0.9667816162109375,
+   "first_tokens": [
+    [
+     1961,
+     1345,
+     1032,
+     1010
+    ]
+   ]
+  },
+  {
+   "batch": 128,
+   "repeat": 0,
+   "steps": 127,
+   "steady_steps": 96,
+   "model_forward_ms_per_step": 14.443573067585627,
+   "wall_ms_per_step": 16.29382915628715,
+   "tokens_per_s_forward": 8862.073075758417,
+   "tokens_per_s_wall": 7855.734755302121,
+   "wave_s": 20.270659685134888,
+   "first_tokens": [
+    [
+     1961,
+     1345,
+     1032,
+     1010
+    ],
+    [
+     1032,
+     1049,
+     1048,
+     1048
+    ],
+    [
+     1032,
+     1267,
+     1032,
+     1010
+    ],
+    [
+     1032,
+     1010,
+     1032,
+     1010
+    ]
+   ]
+  },
+  {
+   "batch": 256,
+   "repeat": 0,
+   "steps": 127,
+   "steady_steps": 96,
+   "model_forward_ms_per_step": 18.306619664033253,
+   "wall_ms_per_step": 21.68410323959809,
+   "tokens_per_s_forward": 13984.012597528283,
+   "tokens_per_s_wall": 11805.8836545525,
+   "wave_s": 39.34699845314026,
+   "first_tokens": [
+    [
+     1961,
+     1345,
+     1032,
+     1010
+    ],
+    [
+     1032,
+     1049,
+     1048,
+     1048
+    ],
+    [
+     1032,
+     1267,
+     1032,
+     1010
+    ],
+    [
+     1032,
+     1010,
+     1032,
+     1010
+    ]
+   ]
+  },
+  {
+   "batch": 512,
+   "repeat": 0,
+   "steps": 127,
+   "steady_steps": 96,
+   "model_forward_ms_per_step": 25.426593621571858,
+   "wall_ms_per_step": 31.984158625012544,
+   "tokens_per_s_forward": 20136.39764807585,
+   "tokens_per_s_wall": 16007.92461051644,
+   "wave_s": 77.4934983253479,
+   "first_tokens": [
+    [
+     1961,
+     1345,
+     1032,
+     1010
+    ],
+    [
+     1032,
+     1049,
+     1048,
+     1048
+    ],
+    [
+     1032,
+     1267,
+     1032,
+     1010
+    ],
+    [
+     1032,
+     1010,
+     1032,
+     1010
+    ]
+   ]
+  },
+  {
+   "batch": 848,
+   "repeat": 0,
+   "steps": 127,
+   "steady_steps": 96,
+   "model_forward_ms_per_step": 34.72793467839559,
+   "wall_ms_per_step": 46.465779333326886,
+   "tokens_per_s_forward": 24418.382718496207,
+   "tokens_per_s_wall": 18249.98982405498,
+   "wave_s": 127.39929032325745,
+   "first_tokens": [
+    [
+     1961,
+     1345,
+     1032,
+     1010
+    ],
+    [
+     1032,
+     1049,
+     1048,
+     1048
+    ],
+    [
+     1032,
+     1267,
+     1032,
+     1010
+    ],
+    [
+     1032,
+     1010,
+     1032,
+     1010
+    ]
+   ]
+  }
+ ]
+}

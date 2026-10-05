@@ -57,11 +57,40 @@ def cuda_decode(state, x, dt, A, B, C, D, dt_bias, x_cache, dt_cache, B_cache,
     )  # fmt: skip
 
 
-def mamba2_step(mode, batch, args, layout):
+_POOLS = {}
+
+
+def pool_state(batch, H, P, N, page_bytes, slot_stride, offset_bytes, key_major,
+               dev, pool_id=0, group=0):  # fmt: skip
+    """FP32 states inside a vLLM-like KV pool: one ``page_bytes`` page per block,
+    the state ``offset_bytes`` into its page. A request takes one block per
+    KV-cache group, so request i of group ``group`` sits in block
+    ``1 + group + slot_stride * i``; layers of different groups share a pool
+    tensor (``pool_id``), as vLLM's hybrid layout does."""
+    blocks = 2 + slot_stride * batch
+    key = (pool_id, blocks, page_bytes)
+    if key not in _POOLS:
+        _POOLS[key] = torch.randn(blocks * page_bytes // 4, device=dev) * 0.1
+    inner = (P * N, 1, P) if key_major else (P * N, N, 1)
+    state = torch.as_strided(_POOLS[key], (blocks, H, P, N),
+                             (page_bytes // 4, *inner), offset_bytes // 4)  # fmt: skip
+    slots = (1 + group + slot_stride * torch.arange(batch, device=dev)).to(torch.int32)
+    return state, slots
+
+
+def mamba2_step(mode, batch, args, layout, page_bytes=None, slot_stride=1,
+                offset_bytes=0, pool_id=0, group=0):  # fmt: skip
+    """One layer's decode step. ``page_bytes`` places the states as vLLM's KV
+    pool does (see ``pool_state``); by default they are one contiguous tensor."""
     H, G, P, N = args.num_heads, args.ngroups, args.head_dim, args.state_size
     L, dev = args.window, "cuda"
-    slots = torch.arange(1, batch + 1, dtype=torch.int32, device=dev)
-    state = torch.randn(batch + 1, H, P, N, device=dev) * 0.1
+    if page_bytes:
+        state, slots = pool_state(batch, H, P, N, page_bytes, slot_stride,
+                                  offset_bytes, mode in ("sketch", "triton"), dev,
+                                  pool_id, group)  # fmt: skip
+    else:
+        slots = torch.arange(1, batch + 1, dtype=torch.int32, device=dev)
+        state = torch.randn(batch + 1, H, P, N, device=dev) * 0.1
     # x, B and C are column slices of one conv output row, as in the model.
     xbc = torch.randn(batch, H * P + 2 * G * N, device=dev, dtype=torch.bfloat16)
     x = xbc[:, : H * P].view(batch, H, P)
@@ -78,10 +107,11 @@ def mamba2_step(mode, batch, args, layout):
             state_batch_indices=slots, dst_state_batch_indices=slots, out=out,
         )  # fmt: skip
     write_pos, is_flush = ring_phase(args, batch, dev)
+    rows = state.shape[0]  # rings are indexed by the same slots as the state
     rings = dict(
-        x_cache=torch.randn(batch + 1, H, L, P, device=dev, dtype=torch.bfloat16),
-        dt_cache=torch.rand(batch + 1, H, L, device=dev) * 0.1,
-        B_cache=torch.randn(batch + 1, G, L, N, device=dev, dtype=torch.bfloat16),
+        x_cache=torch.randn(rows, H, L, P, device=dev, dtype=torch.bfloat16),
+        dt_cache=torch.rand(rows, H, L, device=dev) * 0.1,
+        B_cache=torch.randn(rows, G, L, N, device=dev, dtype=torch.bfloat16),
         bc_pre=torch.empty(batch, G, L, device=dev),
     )
     if mode in ("sketch", "triton"):
@@ -106,7 +136,8 @@ def mamba2_sketch_step(decode, batch, layout, state, x, dt, A, B, C, D, dt_bias,
     """SketchSSM as the model runs it: the layer's frames, key-major state and
     BF16 dt/D/dt_bias."""
     heads, dim, dstate = state.shape[1:]
-    state = state.transpose(-1, -2).contiguous().transpose(-1, -2)
+    if state.stride(-2) != 1:  # pool_state already key-major
+        state = state.transpose(-1, -2).contiguous().transpose(-1, -2)
     ranks = layout.ranks.cpu()
     shapes = sk_ops.sketch_shapes(ranks, dim, dstate)
     buffers = (torch.zeros(batch, *s, dtype=d)

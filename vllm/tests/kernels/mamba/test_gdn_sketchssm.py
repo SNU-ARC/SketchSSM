@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GDN SketchSSM decode (CUDA and Triton) against an FP64 oracle.
-
-q and k arrive unrotated; the state lives in the rotated key frame of random
-orthogonal frames R (one per key head). The oracle runs in that frame, and a
-flush is the exact delta-rule recurrence of the window's BF16 inputs."""
+"""GDN SketchSSM decode (CUDA and Triton) against an FP64 oracle."""
 
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -41,11 +37,6 @@ Request = lambda slot, meta, start=0: SimpleNamespace(slot=slot, meta=meta, star
 PAD = Request(0, 0)
 
 
-def random_frames(h: int, seed: int = 5) -> torch.Tensor:
-    g = torch.Generator().manual_seed(seed)
-    return torch.linalg.qr(torch.randn(h, K, K, generator=g, dtype=torch.float64))[0]
-
-
 def coefficient(s: torch.Tensor, m: int) -> torch.Tensor:
     """FP64 four-pivot residual-diagonal coefficient map (ridge 0.003)."""
     mean = s.square().sum(0).mean()
@@ -80,12 +71,8 @@ class Harness:
         with torch.device("cuda"):
             self.tables = common.GDNSketchTables(torch.tensor(widths), self.H, window)
         self.sketch = common.GDNSketchArgs.allocate(self.tables, NR, "cuda")
-        self.R = random_frames(self.H)  # FP64 (H, K, K)
-        self.frames_t = common.gdn_rotation_from_frames(self.R.float()).cuda()
-        # d ring: W BF16 rows + W fp16 residual rows; k ring: W raw BF16 keys + W
-        # fp16 rows each of hi and lo of 2^10 x the rotated unit keys
-        self.dr = torch.full((NX, self.HV, 2 * window, V), torch.nan).bfloat16().cuda()
-        self.kr = torch.full((NX, self.H, 3 * window, K), torch.nan).bfloat16().cuda()
+        self.dr = torch.full((NX, self.HV, window, V), torch.nan).bfloat16().cuda()
+        self.kr = torch.full((NX, self.H, window, K), torch.nan).bfloat16().cuda()
         self.gr = torch.zeros(NX, self.HV, window, device="cuda")
         self.al = torch.randn(self.HV, device="cuda") * 0.05
         self.bias = torch.zeros(self.HV, device="cuda")
@@ -95,8 +82,7 @@ class Harness:
         common.gdn_sketch_build(self.state, i32(flags), slots, meta, self.sketch)
 
     def inputs(self, n: int) -> list[torch.Tensor]:
-        # BF16 activations (also for FP32 io): the key ring keeps keys in BF16
-        mix = (torch.randn(n, (2 * self.H + self.HV) * K, device="cuda") * 0.25).bfloat16()
+        mix = torch.randn(n, (2 * self.H + self.HV) * K, device="cuda") * 0.25
         a = torch.randn(n, self.HV, device="cuda") * 0.2 - 3
         b = torch.randn(n, self.HV, device="cuda") * 0.5
         return [x.to(self.dtype) for x in (mix, a, b)]
@@ -106,21 +92,15 @@ class Harness:
         flush = [i for i, (r, t) in enumerate(zip(rows, positions))
                  if r.slot and t == self.W - 1]  # fmt: skip
         idx = [i32([r.slot for r in rows]), i32(positions), i32([r.meta for r in rows]),
-               i32(flush + [-2 - len(flush)] * (len(rows) - len(flush)))]  # fmt: skip
-        qk = common.gdn_sketch_qk(mix, self.frames_t)
+               i32(flush + [-1] * (len(rows) - len(flush)))]  # fmt: skip
         return lambda: self.decode_fn(
             mix, a, b, self.al, self.bias, out, self.state, self.dr, self.kr,
             self.gr, *idx, self.sketch, K**-0.5, has_flush_rows=bool(flush),
-            qk=qk,
         )  # fmt: skip
-
-    def rot(self, x: torch.Tensor) -> torch.Tensor:
-        """Key-head vectors ``(..., H, K)`` into the rotated frame."""
-        return torch.einsum("hjk,...hk->...hj", self.R, x)
 
     def window_start(self, r) -> None:
         """The window-start state and the stored coefficient maps."""
-        r.s0, r.coeff, r.F, r.vals = c(self.state[r.slot]), {}, {}, {}
+        r.s0, r.coeff, r.F = c(self.state[r.slot]), {}, {}
         for h, m in enumerate(self.widths):
             r.coeff[h], r.F[h] = torch.eye(K).double() if m == K else None, []
             if 0 < m < K:
@@ -140,14 +120,12 @@ class Harness:
             if r.slot and t == 0:
                 self.window_start(r)
         mix, a, b = self.inputs(n)
-        q = self.rot(unit(c(mix[:, : H * K]).reshape(n, H, K))) / K**0.5
-        k = self.rot(unit(c(mix[:, H * K : 2 * H * K]).reshape(n, H, K)))
+        q = unit(c(mix[:, : H * K]).reshape(n, H, K)) / K**0.5
+        k = unit(c(mix[:, H * K : 2 * H * K]).reshape(n, H, K))
         v = c(mix[:, 2 * H * K :]).reshape(n, HV, V)
         alpha = torch.exp(-c(self.al).exp() * F.softplus(c(a) + c(self.bias)))
         beta = c(b).sigmoid()
-        dr, gr, br = c(self.dr[:, :, :W]), c(self.gr), c(self.sketch.beta)
-        # the key ring holds the raw keys: unit and rotated here
-        kr = self.rot(unit(c(self.kr[:, :, :W]).transpose(1, 2))).transpose(1, 2)
+        dr, kr, gr, br = map(c, (self.dr, self.kr, self.gr, self.sketch.beta))
         expected, exp_d, exp_s = torch.zeros(n, HV, V).double(), {}, {}
         for bi, (r, t) in enumerate(zip(rows, positions)):
             for h, m in enumerate(self.widths if r.slot else []):
@@ -167,16 +145,18 @@ class Harness:
                     hq, hk = bf(s0) @ qh, bf(s0) @ kh
                     dc = bt * (v[bi, h] - at * (tot * hk + sk))
                 expected[bi, h], exp_d[s, h] = at * (tot * hq + sq) + dc * ktq, dc
-                r.vals[h] = [*(r.vals[h] if t else []), v[bi, h]]
-                if t == W - 1:  # exact flush: the recurrence of the window's inputs
-                    keys, betas = torch.cat([keys, kh[None]]), br[r.meta, h]
+                if t == W - 1:  # exact flush: W erases and updates from s0
+                    keys, betas = torch.cat([keys, bf(kh)[None]]), br[r.meta, h]
                     gates, betas[-1] = torch.cat([g, at.log()[None]]), bt
-                    vals = torch.stack(r.vals[h])
-                    st = s0.clone()
+                    # Dense heads stored full updates from bf(s0): erase the rest.
+                    st = s0 if m else s0 - bf(s0)
                     for j in range(W):
-                        st = gates[j].exp() * st
-                        st = st + (betas[j] * (vals[j] - st @ keys[j]))[:, None] * keys[j]
-                    exp_s[s, h] = st
+                        erase = (st @ keys[j])[:, None] * keys[j][None, :]
+                        st = gates[j].exp() * (st - betas[j] * erase)
+                    if not m:
+                        st += bf(s0) * gates.exp().prod()
+                    rep = (gates.sum() - gates.cumsum(0)).exp()[:, None]
+                    exp_s[s, h] = st + (torch.cat([ds, dc[None]]) * rep).T @ keys
                     expected[bi, h] = exp_s[s, h] @ qh
         out, before = torch.empty(n, HV, V, dtype=dt, device="cuda"), self.state.clone()
         self.decode(mix, a, b, out, rows, positions)()
@@ -189,14 +169,13 @@ class Harness:
             s = r.slot
             if not s:
                 assert not out[bi].any()
-            elif t < W - 1:  # the ring rows of this step: d, and k, v as input
+            elif t < W - 1:  # the ring rows of this step
                 d_ref = bf(torch.stack([exp_d[s, h] for h in range(HV)]))
                 assert max(map(relative, c(self.dr[s, :, t]), d_ref)) < 0.004
-                k_in = mix[bi, H * K : 2 * H * K].view(H, K).bfloat16()
-                assert torch.equal(self.kr[s, :, t], k_in)
+                assert relative(c(self.kr[s, :, t]), bf(k[bi])) < 0.002
             else:
                 target = torch.stack([exp_s[s, h] for h in range(HV)])
-                assert relative(c(self.state[s]), target) < 2e-5, "flush"
+                assert relative(c(self.state[s]), target) < 4e-4, "flush"
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

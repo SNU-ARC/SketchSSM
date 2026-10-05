@@ -320,6 +320,19 @@ class CacheConfig:
         dense heads only for GDN ReplaySSM."""
         return self.sketchssm is not None or self.use_gdn_replayssm
 
+    @property
+    def gdn_official_replayssm(self) -> bool:
+        """Whether GDN ReplaySSM runs the authors' Triton kernel (rings
+        ``d (HV, L, V)``, ``k (H, L, K)``, ``g (HV, L)``) instead of the
+        SketchSSM kernels with dense heads."""
+        import vllm.envs as envs
+
+        return (
+            self.use_gdn_replayssm
+            and self.sketchssm is None
+            and envs.VLLM_GDN_REPLAYSSM_KERNEL == "official"
+        )
+
     _block_size_resolved: bool = field(default=False, init=False)
     """Guard against pydantic re-running _apply_block_size_default."""
 

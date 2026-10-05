@@ -1,0 +1,75 @@
+{
+ "arm": "g8",
+ "context": 2048,
+ "batch": 512,
+ "layers": 40,
+ "per_step": {
+  "n": 96,
+  "recurrent_us": 5632.328895833334,
+  "recurrent_per_layer_us": 140.80822239583335,
+  "components_per_layer_us": {
+   "readout": 69.47377213541667,
+   "flush": 60.77491145833335,
+   "finish": 0.0,
+   "input copy": 0.0,
+   "shared B/C": 4.948952343749999,
+   "basis transform": 5.610586458333334
+  },
+  "categories_us": {
+   "GEMM": 13610.260739583333,
+   "Linear attention": 5632.328895833334,
+   "Softmax attention": 754.8489375,
+   "Others": 3588.486729166667
+  },
+  "kernel_sum_us": 23585.925302083335,
+  "span_us": 25276.339302083332,
+  "range_us": 2034.8716770833332
+ },
+ "nonflush": {
+  "n": 90,
+  "recurrent_us": 3588.173622222222,
+  "recurrent_per_layer_us": 89.70434055555555,
+  "components_per_layer_us": {
+   "readout": 72.31503166666667,
+   "flush": 6.703151666666669,
+   "finish": 0.0,
+   "input copy": 0.0,
+   "shared B/C": 5.0799827777777775,
+   "basis transform": 5.606174444444445
+  },
+  "categories_us": {
+   "GEMM": 13594.52488888889,
+   "Linear attention": 3588.173622222222,
+   "Softmax attention": 753.3746,
+   "Others": 3587.564566666667
+  },
+  "kernel_sum_us": 21523.637677777777,
+  "span_us": 23278.80661111111,
+  "range_us": 2035.060511111111
+ },
+ "flush": {
+  "n": 6,
+  "recurrent_us": 36294.65800000001,
+  "recurrent_per_layer_us": 907.3664500000002,
+  "components_per_layer_us": {
+   "readout": 26.854879166666667,
+   "flush": 871.8513083333335,
+   "finish": 0.0,
+   "input copy": 0.0,
+   "shared B/C": 2.9834958333333335,
+   "basis transform": 5.6767666666666665
+  },
+  "categories_us": {
+   "GEMM": 13846.2985,
+   "Linear attention": 36294.65800000001,
+   "Softmax attention": 776.9639999999999,
+   "Others": 3602.319166666667
+  },
+  "kernel_sum_us": 54520.239666666675,
+  "span_us": 55239.329666666665,
+  "range_us": 2032.0391666666667
+ },
+ "window": {
+  "recurrent_per_layer_us": 2252.9315583333337
+ }
+}

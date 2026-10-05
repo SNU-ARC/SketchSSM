@@ -62,7 +62,7 @@ was built with, so install `sketchssm` alongside it.
 ```python
 from sketchssm import kernels as sk
 
-sk.API_VERSION                     # 4; bumped on a breaking change
+sk.API_VERSION                     # 3; bumped on a breaking change
 sk.set_config_dirs([folder, ...])  # extra tuned-config folders
 sk.set_aot_dirs([folder, ...])     # extra precompiled-kernel folders
 sk.set_cache_dir(path)             # where the NVRTC builds go
@@ -80,7 +80,7 @@ sk.gdn_supported(num_k_heads, num_v_heads, head_k_dim, head_v_dim, window,
 sk.gdn.check_resources(num_k_heads, num_v_heads, window)  # raises ValueError
 sk.gdn_decode(mixed_qkv, a, b, A_log, dt_bias, out, state, d_cache, k_cache,
               g_cache, slots, write_pos, meta, flush_rows, sketch, scale,
-              null_block_id=0, has_flush_rows=True, *, qk=None)
+              null_block_id=0, has_flush_rows=True)
 # KDA
 sk.kda_supported(num_heads, head_k_dim, head_v_dim, window, activation_dtype,
                  state_dtype, lower_bound=-5.0) -> Support
@@ -104,8 +104,6 @@ sk.kda_cold_build(state, rings, slots, meta, rows, sketch, scratch,
 **The window.** `W` is read from the ring shapes. It can be any multiple of 16.
 
 **Mamba-2 frames.** The Mamba-2 state is kept in a rotated frame R per group (`frames_t` = Rᵀ, `(groups, N, N)` FP32), but B and C stay unrotated where precision matters: the B ring holds the BF16 B (as ReplaySSM does) and `bc_pre`, the ring's B·C products, comes from the unrotated B and C. The caller fills `bc_pre` and passes the FP32 query R·C as `C` (in vLLM, the Triton `sketch_bc_pre` and `sketch_query`). The flush kernel rotates the window keys R·B_t itself to FP32 accuracy (BF16 keys times the frame split into three BF16 terms on tensor cores), once per CTA for the `WARPS` heads of a group it serves. `run_with_flush(flush, nonflush)` lets the caller overlap the two launches. vLLM runs the flush on a side stream.
-
-**GDN frames and the exact flush.** The GDN state is kept in a rotated key frame R per key head, but q and k stay unrotated in the activations: the key ring holds the BF16 keys as they are and ring dots use them unrotated; the sketch and state reads take `qk`, the FP32 rotated R q and R k `(batch, 2, H, K)` the caller computes (in vLLM, the Triton `gdn_sketch_qk`; None without a frame, as for ReplaySSM). The rings carry extra rows the flush alone reads: `d_cache` is `(slots, HV, 2W, V)` (W BF16 rows d that the steps read, then W fp16 rows of d - bf16(d) in units of its bf16 ulp) and `k_cache` `(slots, H, 3W, K)` (W BF16 raw keys, then W fp16 rows each of the hi and lo of 2^10 x the unit keys in the rotated frame). From them the flush solves the window's WY system for the exact updates, `D = H + (R - P_c diag(beta exp(pre))) M`, with `P_c` the part of the window-start state the steps did not read exactly (all of it for sketch heads, the BF16 residual for dense heads with rows, none for ReplaySSM), on fp16 hi/lo tensor-core MMAs to FP32 accuracy; the sketch coefficient finish runs as a second, small launch. The flush is exact for BF16 activations (vLLM's model dtype); FP32 activations are kept in BF16 in the key ring.
 
 ## Supported shapes
 

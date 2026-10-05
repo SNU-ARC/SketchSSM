@@ -1,0 +1,31 @@
+{
+ "arm": "standard",
+ "context": 2048,
+ "batch": 256,
+ "layers": 40,
+ "per_step": {
+  "n": 96,
+  "recurrent_us": 17052.478864583332,
+  "recurrent_per_layer_us": 426.3119716145833,
+  "components_per_layer_us": {
+   "readout": 426.3119716145833,
+   "flush": 0.0,
+   "finish": 0.0,
+   "input copy": 0.0,
+   "shared B/C": 0.0,
+   "basis transform": 0.0
+  },
+  "categories_us": {
+   "GEMM": 11153.651041666666,
+   "Linear attention": 17052.478864583332,
+   "Softmax attention": 469.92740625,
+   "Others": 3348.0407083333334
+  },
+  "kernel_sum_us": 32024.09802083333,
+  "span_us": 31858.57459375,
+  "range_us": 859.0719166666667
+ },
+ "window": {
+  "recurrent_per_layer_us": 6820.991545833333
+ }
+}

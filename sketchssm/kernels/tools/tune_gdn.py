@@ -30,7 +30,7 @@ from sketchssm.kernels.tools.benchmark_utils import (
 )
 
 # Scheduling knobs only. The step's SKETCH_BF16,
-# NF_FFMA2 and NF_ABLATE and the flush's W1_NOSKETCH, W1_NOSK and
+# NF_FFMA2 and NF_ABLATE and the flush's W1_KBF16, W1_NOSKETCH, W1_NOSK and
 # W1_ABLATE change the math or skip work, so they are not tuned.
 # ROWS_PER_PROGRAM is the flush launch's rows per CTA.
 SPACE = {
