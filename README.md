@@ -29,13 +29,14 @@ SketchSSM keeps the full-state updates and approximates the reads:
 - **Flush step** (every W steps): read the full state S<sub>0</sub> once, apply
   the buffered updates from the ring buffer, compute the compact sketch U from
   the updated state, and write back the state and the sketch.
-- **Non-flush steps**: combine the sketch U with query-dependent coefficients
-  c<sub>t</sub> to reconstruct the output, without reading S<sub>0</sub>.
+- **Non-flush steps**: combine the sketch U and the coefficient map C with the
+  query to reconstruct the output, without reading S<sub>0</sub>.
 
 The sketching matrix is computed once per model by offline calibration. The
 sketch size (the mean sketch rank per state head) is chosen as a serving
 configuration and sets the trade-off between traffic reduction and accuracy. Across Mamba-2, GDN and KDA models, SketchSSM
-reduces state-access traffic by about 10x while largely preserving accuracy.
+at mean sketch rank 8 reduces state-access traffic by about 10x while matching the
+average accuracy of the full-state baseline.
 
 <p align="center">
   <img src="assets/sketchssm-overview.png" alt="SketchSSM over a window: flush and non-flush steps" width="100%">
@@ -117,19 +118,21 @@ See [`vllm/README.md`](https://github.com/SNU-ARC/SketchSSM/blob/main/vllm/READM
 **Accuracy versus state access traffic** (paper, Figure 5). Accuracy on
 MATH-500, AIME25, GPQA Diamond and LiveCodeBench for Nemotron Nano v2,
 Nemotron 3 Super, Qwen3.8 Flash-Next and GLM 5.3 Flash, against the reduction
-in state access traffic relative to Standard. SketchSSM (W=16) largely
-preserves accuracy up to about 10x, while pruning (GHOST, DRRQR) and
-quantization (DSQ) lose accuracy at much smaller reductions.
+in state access traffic relative to Standard. At mean rank 8 (W=16, 9.4-10.7x
+less state traffic), SketchSSM matches Standard's average accuracy on all four
+models, while pruning (GHOST, DRRQR) and quantization (DSQ) lose accuracy at
+much smaller reductions.
 
 <p align="center">
   <img src="assets/sketchssm-latency.png" alt="Linear-attention latency on one NVIDIA B300" width="100%">
 </p>
 
 **Linear-attention latency on one NVIDIA B300** (paper, Figure 7; W=16, batch
-128, 256 and 512): (a) a non-flush step, (b) a flush step, (c) a whole window.
-Over a window at batch 512, SketchSSM is 7.78x faster than Standard on Nemotron
-3 Super (Mamba-2), 5.22x on Qwen3.8 Flash-Next (GDN) and 5.20x on GLM 5.3 Flash
-(KDA).
+128, 256 and 512): (a) a non-flush step, (b) a flush step, (c) the speedup
+over Standard across a whole window. At mean rank 8 and batch 512, SketchSSM is
+7.30x faster than Standard on Nemotron 3 Super (Mamba-2), 5.02x on Qwen3.8
+Flash-Next (GDN) and 5.24x on GLM 5.3 Flash (KDA), and 3.24x, 3.43x and 3.69x
+faster than ReplaySSM.
 
 See [`evaluation/`](https://github.com/SNU-ARC/SketchSSM/blob/main/evaluation/README.md) to measure a model's accuracy
 (IFEval, MATH-500, HumanEval, MBPP), its decode throughput at a chosen batch

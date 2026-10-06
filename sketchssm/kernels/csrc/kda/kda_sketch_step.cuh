@@ -166,8 +166,11 @@ kda_step_kernel(const int* __restrict__ Heads, int NH,
         if (nd > 1) stage8(st, CB, dr, 8, pos);                  // second d chunk -> Y1, else a second Phi chunk -> Y1
         else if (np > 1) stage8(st, CB, phi, 8, m);
         cp_commit();
-        fa[0] = *(const unsigned*)(fr); fa[1] = *(const unsigned*)(fr + 8 * KDA_W);
-        fa[2] = *(const unsigned*)(fr + 8); fa[3] = *(const unsigned*)(fr + 8 * KDA_W + 8);
+        // ranks 8..15 exist only when the padded rank G > 8: past it the rows are the next
+        // (slot, head) block, or past the end of FR for the last one
+        const bool hi = G > 8;
+        fa[0] = *(const unsigned*)(fr); fa[1] = hi ? *(const unsigned*)(fr + 8 * KDA_W) : 0u;
+        fa[2] = *(const unsigned*)(fr + 8); fa[3] = hi ? *(const unsigned*)(fr + 8 * KDA_W + 8) : 0u;
 #if S8_PREFETCH
         #pragma unroll
         for (int i = 0; i < 4; ++i) {                            // the readout rows (u rows t < pos, U rows g < m) into L2 now
@@ -358,8 +361,9 @@ kda_step_kernel(const int* __restrict__ Heads, int NH,
     }
     for (int gc = 0; gc < m; gc += 16) {
         if (gc > 0) {
-            fa[0] = *(const unsigned*)(fr + gc * KDA_W); fa[1] = *(const unsigned*)(fr + gc * KDA_W + 8 * KDA_W);
-            fa[2] = *(const unsigned*)(fr + gc * KDA_W + 8); fa[3] = *(const unsigned*)(fr + gc * KDA_W + 8 * KDA_W + 8);
+            const bool hi = gc + 8 < G;                          // ranks gc + 8 .. gc + 15 within the padded rank
+            fa[0] = *(const unsigned*)(fr + gc * KDA_W); fa[1] = hi ? *(const unsigned*)(fr + gc * KDA_W + 8 * KDA_W) : 0u;
+            fa[2] = *(const unsigned*)(fr + gc * KDA_W + 8); fa[3] = hi ? *(const unsigned*)(fr + gc * KDA_W + 8 * KDA_W + 8) : 0u;
         }
         float sk[4] = {0.f, 0.f, 0.f, 0.f};
         mma16816_bf16(sk, fa, kb[0], kb[1]);
@@ -367,8 +371,9 @@ kda_step_kernel(const int* __restrict__ Heads, int NH,
             for (int kt = 1; kt < KDA_W / 16 && 16 * kt < pos; ++kt) {
                 unsigned fb[4], kbt[2];
                 const __nv_bfloat16* fk = fr + gc * KDA_W + 16 * kt;
-                fb[0] = *(const unsigned*)(fk); fb[1] = *(const unsigned*)(fk + 8 * KDA_W);
-                fb[2] = *(const unsigned*)(fk + 8); fb[3] = *(const unsigned*)(fk + 8 * KDA_W + 8);
+                const bool hi = gc + 8 < G;
+                fb[0] = *(const unsigned*)(fk); fb[1] = hi ? *(const unsigned*)(fk + 8 * KDA_W) : 0u;
+                fb[2] = *(const unsigned*)(fk + 8); fb[3] = hi ? *(const unsigned*)(fk + 8 * KDA_W + 8) : 0u;
                 const float* sw = s_kk + KDA_W * (g >> 1) + 16 * kt + 2 * c;
                 const float2 w0 = *(const float2*)(sw), w1 = *(const float2*)(sw + 8);
                 unsigned h0, l0, h1, l1;
