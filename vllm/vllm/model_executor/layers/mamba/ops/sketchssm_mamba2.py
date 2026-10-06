@@ -427,7 +427,7 @@ def _sketch_head(
         z3 = z3 / tl.sqrt(safe_mean)
         residual = tl.maximum(e - z0 * z0 - z1 * z1 - z2 * z2 - z3 * z3, 0.0)
         residual = tl.where(j < tl.minimum(m, P), 0.0, residual)
-        denominator = residual + 0.003  # ridge (branch ridge-0p003)
+        denominator = residual + 0.003  # ridge
         a = residual / denominator
         b0 = tl.where(j < m, z0 / denominator, 0.0)
         g0 = b0 / (1.0 + tl.sum(z0 * b0))

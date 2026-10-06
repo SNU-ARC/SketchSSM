@@ -349,7 +349,7 @@ __device__ __forceinline__ void w1_store_tile(const float (&acc)[16][4], float* 
 // Coefficient finish from the accumulated statistics (energy E[k], Gram rows G4[j][k]).  Directions:
 // q_p = sum_j R[p][j] U_j with L L^T = G4[:4,:4] (Cholesky; a pivot whose residual energy is not above
 // 1e-12 x its own energy is dropped exactly like the two-pass Gram-Schmidt), R = L^-1, so
-// z_p[k] = sum_j R[p][j] G4[j][k].  The rest is the pivot_stats/inline_finish arithmetic (ridge 0.1).
+// z_p[k] = sum_j R[p][j] G4[j][k].  The rest is the pivot_stats/inline_finish arithmetic (ridge SK_RIDGE = 0.003).
 __device__ __forceinline__ void w1_finish(const float* stats, sketch_t* out, int m, int G, int lane) {
     constexpr int P = 4;
     const int n = min(m, P);

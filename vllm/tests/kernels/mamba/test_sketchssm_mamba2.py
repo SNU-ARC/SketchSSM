@@ -38,7 +38,7 @@ def sketch_read(s: torch.Tensor, q: torch.Tensor, m: int) -> torch.Tensor:
     residual = (norm.square().sum(0) - z.square().sum(0)).clamp_min(0)
     residual[: len(dirs)] = 0
     metric = torch.diag(residual) + z.T @ z
-    ridge = 0.1 * torch.eye(m, dtype=s.dtype, device=s.device)
+    ridge = 0.003 * torch.eye(m, dtype=s.dtype, device=s.device)
     return s[:, :m] @ torch.linalg.solve(metric[:m, :m] + ridge, metric[:m] @ q)
 
 

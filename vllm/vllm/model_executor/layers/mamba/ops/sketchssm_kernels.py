@@ -32,7 +32,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 logger = init_logger(__name__)
 
-SKETCHSSM_KERNELS_API = 3
+SKETCHSSM_KERNELS_API = 5
 
 
 @functools.cache
