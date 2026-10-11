@@ -6,6 +6,7 @@ model:
   checkpoint: nvidia/NVIDIA-Nemotron-Nano-9B-v2
   revision: 6533e8de2c68e4536bf7c411d7a3ce5734111476
   tokenizer_revision: 6533e8de2c68e4536bf7c411d7a3ce5734111476
+  layer_ids: [0, 2, 4, 6, 7, 9, 11, 13, 16, 18, 20, 23, 25, 27, 29, 32, 34, 36, 38, 41, 43, 44, 46, 48, 50, 52, 54]
 geometry:
   key_dim: 128
   value_dim: 80

@@ -136,7 +136,7 @@ gradient statistics or tokens.
 | `omega` | float32 L,groups,R,K | Bundle basis, unchanged |
 | `basis_fingerprint`, `basis_meta` | str, dict | Basis identity and fitting metadata |
 | `curves` | dict | `joint_dot_sq_sum` (float64 L,H,R+1), `joint_nstep` (int), `meta` (includes `coefficient_model` and `basis_fingerprint`) |
-| `layer_ids` | optional list | Original recurrent-layer identifiers, when the basis provides them |
+| `layer_ids` | list | Model layer index of each calibrated recurrent layer, from the basis or `model.layer_ids` in `config.yaml` |
 | `verified_mean_ranks` | list | Mean ranks checked against bundle tables |
 | `verified` | dict | Per rank (`format(float(G), 'g')`): `dense_heads`, `sketch_heads`, `table_sha256` |
 

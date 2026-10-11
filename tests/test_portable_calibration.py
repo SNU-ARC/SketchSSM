@@ -61,7 +61,9 @@ def assert_same_export(test, actual, expected):
     for key in ('frames', 'm_table', 'dense_table'):
         test.assertEqual(actual[key].dtype, expected[key].dtype, key)
         test.assertTrue(torch.equal(actual[key], expected[key]), key)
-    test.assertEqual(actual.get('layer_ids'), expected.get('layer_ids'))
+    # Bundles exported before the collectors recorded layer_ids omit them.
+    if 'layer_ids' in expected:
+        test.assertEqual(actual['layer_ids'], expected['layer_ids'])
 
 
 class PortableCalibrationTests(unittest.TestCase):
@@ -175,7 +177,7 @@ def make_erase_calibration(window=16):
              max_rank=calibration._crossover(geometry), omega=omega, basis_fingerprint=fp,
              curves=dict(joint_dot_sq_sum=steps.flip(-1).cumsum(-1).flip(-1), joint_nstep=1,
                          meta=dict(coefficient_model='full-gram', basis_fingerprint=fp)),
-             verified_mean_ranks=MEAN_RANKS, verified={})
+             layer_ids=[0, 1], verified_mean_ranks=MEAN_RANKS, verified={})
     for G in MEAN_RANKS:
         table = calibration.select(c, G)
         c['verified'][calibration.rank_key(G)] = dict(

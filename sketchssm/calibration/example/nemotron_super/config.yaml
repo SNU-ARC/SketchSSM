@@ -6,6 +6,7 @@ model:
   checkpoint: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
   revision: ff433f5493e25d631c9f12b5d55c674229923d02
   tokenizer_revision: ff433f5493e25d631c9f12b5d55c674229923d02
+  layer_ids: [0, 2, 4, 6, 9, 11, 13, 15, 18, 20, 22, 24, 27, 29, 31, 33, 35, 38, 40, 42, 44, 46, 49, 51, 53, 55, 57, 60, 62, 64, 66, 68, 71, 73, 75, 77, 80, 82, 84, 86]
 geometry:
   key_dim: 128
   value_dim: 64

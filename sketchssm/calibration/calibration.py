@@ -90,8 +90,12 @@ def package(bundle):
         curves=dict(joint_dot_sq_sum=curves['joint_dot_sq_sum'].detach().cpu().contiguous(),
                     joint_nstep=int(curves['joint_nstep']), meta=_plain(curves['meta'])),
         verified_mean_ranks=[], verified={})
-    if 'layer_ids' in basis:
-        out['layer_ids'] = [int(i) for i in basis['layer_ids']]
+    # Model layer of each basis row; bundles collected before the native
+    # collectors recorded it list it in config.yaml (model.layer_ids).
+    layer_ids = basis.get('layer_ids', model.get('layer_ids'))
+    if layer_ids is None:
+        raise ValueError('The bundle records no layer_ids (basis or config.yaml model.layer_ids)')
+    out['layer_ids'] = [int(i) for i in layer_ids]
     for G in config['allocation']['mean_ranks']:
         key = rank_key(G)
         reference = load_precomputed(bundle, G)
@@ -126,8 +130,11 @@ def validate(calibration):
     error = c['curves']['joint_dot_sq_sum']
     if error.ndim != 3 or error.shape[0] != omega.shape[0] or error.shape[1] % g['groups']:
         raise ValueError('Score curve shape differs from the basis')
-    if 'layer_ids' in c and len(c['layer_ids']) != omega.shape[0]:
-        raise ValueError('layer_ids length differs from the layer count')
+    layer_ids = c.get('layer_ids')
+    if layer_ids is None or len(layer_ids) != omega.shape[0]:
+        raise ValueError('layer_ids must list the model layer of every basis row')
+    if any(b <= a for a, b in zip(layer_ids, layer_ids[1:])):
+        raise ValueError('layer_ids must be strictly increasing')
     return c
 
 
@@ -169,9 +176,7 @@ def select(calibration, mean_rank, window=None):
     if not isinstance(W, int) or isinstance(W, bool) or W < 2:
         raise ValueError('The window must be an integer of at least 2')
     cap = max_rank(c, W)
-    basis = dict(omega=c['omega'])
-    if 'layer_ids' in c:
-        basis['layer_ids'] = c['layer_ids']
+    basis = dict(omega=c['omega'], layer_ids=c['layer_ids'])
     result = allocate(c['curves'], basis, mean_rank=mean_rank, value_dim=g['value_dim'],
                       window=W, erase=g['erase'], max_rank=cap)
     key = rank_key(mean_rank)
@@ -218,7 +223,8 @@ def manifest(bundle, calibration_path, precision=None):
         sha256=hashlib.sha256(calibration_path.read_bytes()).hexdigest())}
     out.update(geometry=c['geometry'], max_rank=c['max_rank'],
                layers=int(c['omega'].shape[0]), state_heads=int(c['curves']['joint_dot_sq_sum'].shape[1]),
-               omega_shape=list(c['omega'].shape), basis_fingerprint=c['basis_fingerprint'],
+               omega_shape=list(c['omega'].shape), layer_ids=c['layer_ids'],
+               basis_fingerprint=c['basis_fingerprint'],
                verified_mean_ranks=c['verified_mean_ranks'], parity=[])
     for G in c['verified_mean_ranks']:
         derived = select(c, G)
@@ -226,7 +232,10 @@ def manifest(bundle, calibration_path, precision=None):
         table_equal = all(derived[k].dtype == reference[k].dtype and torch.equal(derived[k], reference[k])
                           for k in ('m_table', 'dense_table'))
         ours, theirs = export_frames(derived), export_frames(reference)
-        keys = ['frames', 'm_table', 'dense_table'] + (['layer_ids'] if 'layer_ids' in ours else [])
+        keys = ['frames', 'm_table', 'dense_table']
+        # Bundles exported before the collectors recorded layer_ids omit them.
+        if 'layer_ids' in theirs:
+            keys.append('layer_ids')
         frames_equal = all(
             torch.equal(torch.as_tensor(ours[k]), torch.as_tensor(theirs[k])) for k in keys)
         out['parity'].append(dict(mean_rank=G, dense_heads=int(derived['dense_table'].sum()),
