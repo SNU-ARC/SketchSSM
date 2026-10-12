@@ -1449,7 +1449,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
         if mixed_qkv_non_spec is not None:
-            self._rotate_qk(mixed_qkv_non_spec)
+            # Prefill runs unrotated (its states are rotated after the chunk
+            # scan); only the leading decode tokens are rotated.
+            self._rotate_qk(
+                mixed_qkv_non_spec[: attn_metadata.num_decode_tokens]
+                if attn_metadata.num_prefills > 0
+                else mixed_qkv_non_spec
+            )
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
@@ -1587,6 +1593,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert prefill_has_initial_state is not None
             initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
+            if self.sketchssm is not None:
+                # The cache holds rotated states; the scan runs unrotated.
+                initial_state = self.sketchssm.rotate_states(
+                    initial_state, inverse=True
+                )
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1603,6 +1614,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
             )
+            if self.sketchssm is not None:
+                last_recurrent_state = self.sketchssm.rotate_states(
+                    last_recurrent_state.float()
+                )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
             if self.sketchssm is not None:

@@ -1,0 +1,9 @@
+{
+    "nf": {
+        "NF_MINB": 4,
+        "NF_UBATCH": 1
+    },
+    "flush": {
+        "WARPS": 2
+    }
+}

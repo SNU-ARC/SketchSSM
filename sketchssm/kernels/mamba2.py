@@ -68,6 +68,16 @@ def _shape_flush_defaults(flush: dict, heads_per_group: int, state_size: int) ->
     return flush
 
 
+def shape_default_configs(
+    heads_per_group: int, state_size: int, target: Target | None = None
+) -> tuple[dict, dict]:
+    """Build knobs of a layer shape without a tuned file: the architecture
+    defaults with the shape's flush CTA width. Tuned files store their
+    differences from these."""
+    nf, flush = default_configs(target)
+    return nf, _shape_flush_defaults(flush, heads_per_group, state_size)
+
+
 def config_file_name(
     head_dim: int,
     heads_per_group: int,
@@ -155,8 +165,7 @@ def tuned_config(
     window 16 (``window16_fallback``; if its knobs do not build or fit at this
     window, the build falls back to the defaults), then the defaults.
     """
-    nf, flush = default_configs(target)
-    flush = _shape_flush_defaults(flush, heads_per_group, state_size)
+    nf, flush = shape_default_configs(heads_per_group, state_size, target)
     path = _tuned_path(head_dim, heads_per_group, state_size, window, target)
     if path is not None:
         raw = rt.read_config(path)
@@ -309,6 +318,13 @@ def mamba2_supported(
     support = rt.kernel_support(specs)
     if not support:
         return support
+    # The flush kernel needs the most shared memory. Build it (knobs that do not
+    # fit fall back to the architecture defaults) so that a shape no knobs fit
+    # on this GPU is reported here instead of failing the first decode.
+    try:
+        _flush_ext(tuple(sorted(shape.items())))
+    except RuntimeError as e:
+        return Support(False, str(e).splitlines()[-1] if str(e) else repr(e))
     # The non-flush kernel bakes in the cache strides, known only at run time:
     # NVRTC, unless one was precompiled for this shape (build.py --specs).
     if kn.nvrtc_disabled() or kn._nvrtc.unavailable() is not None:
@@ -344,13 +360,19 @@ def _build(name: str, config: dict, fns: list[str]) -> _Built:
     return _Built(name, config, kn.load(make_spec(name, config)))
 
 
+# Knobs that do not build or fit give way to the architecture defaults; the
+# tuners turn this off so that such a candidate fails.
+FALLBACK_TO_DEFAULTS = True
+
+
 def _build_fitting(name: str, kind: int, d: dict, extra: dict, threads, fns,
                    knobs: dict | None = None):
     """Build ``name`` with the tuned knobs of its shape and check that it fits
     this GPU (the flush kernel raises when its shared memory exceeds the
-    limit; ``threads(knobs)`` threads must fit its registers). Knobs taken
-    from the window-16 file, or the shape defaults when there is no file,
-    that do not build or fit give way to the architecture defaults."""
+    limit; ``threads(knobs)`` threads must fit its registers). Knobs that do
+    not build or fit (a tuned file from an older kernel, the window-16 file
+    at another window, or the shape defaults) give way to the architecture
+    defaults."""
 
     def build(knobs: dict):
         ext = _build(name, dict(knobs, **extra, **d), fns)
@@ -363,7 +385,7 @@ def _build_fitting(name: str, kind: int, d: dict, extra: dict, threads, fns,
         return ext
 
     knobs = knobs if knobs is not None else tuned_config(*_shape_key(d))[kind]
-    if not window16_fallback(*_shape_key(d)) and _tuned_path(*_shape_key(d)) is not None:
+    if not FALLBACK_TO_DEFAULTS:
         return build(knobs)
     try:
         return build(knobs)

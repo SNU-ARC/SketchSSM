@@ -29,6 +29,9 @@ from vllm.model_executor.layers.mamba.ops.sketchssm_kernels import (
     gdn_cuda_decode,
     gdn_cuda_supported,
 )
+from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2 import (
+    sketch_rotate_states,
+)
 from vllm.model_executor.layers.mamba.sketchssm import load_sketchssm_calibration
 from vllm.third_party.flash_linear_attention.ops import (
     fused_recurrent_gated_delta_rule_replayssm,
@@ -55,11 +58,10 @@ class GDNOfficialReplaySSM(torch.nn.Module):
     def rotate_(self, mixed_qkv: torch.Tensor) -> None:
         pass
 
-    def unrotate_state(self, state: torch.Tensor) -> None:
-        pass
-
-    def rotate_state(self, state: torch.Tensor) -> None:
-        pass
+    def rotate_states(
+        self, states: torch.Tensor, inverse: bool = False
+    ) -> torch.Tensor:
+        return states
 
     def prefilled(self, state, attn_metadata, state_indices) -> None:
         pass
@@ -165,6 +167,15 @@ class GDNSketchSSM(torch.nn.Module):
         """Rotate q and k of ``mixed_qkv (tokens, 2 H K + HV V)`` in place."""
         if self.rotation_t is not None:
             gdn_sketch_rotate_(mixed_qkv, self.rotation_t)
+
+    def rotate_states(
+        self, states: torch.Tensor, inverse: bool = False
+    ) -> torch.Tensor:
+        """Prefill states ``(items, HV, V, K)`` FP32 into the rotated frame of
+        the cache (back to the model frame if ``inverse``)."""
+        if self.rotation_t is None:
+            return states
+        return sketch_rotate_states(states, self.rotation_t, inverse)
 
     def prefilled(
         self, state: torch.Tensor, attn_metadata, state_indices: torch.Tensor

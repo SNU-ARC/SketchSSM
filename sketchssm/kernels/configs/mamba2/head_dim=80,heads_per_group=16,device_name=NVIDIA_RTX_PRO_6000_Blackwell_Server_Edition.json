@@ -4,22 +4,7 @@
         "NF_UBATCH": 1
     },
     "flush": {
-        "QREG": 0,
-        "PREFETCH": 1,
-        "UNROLL": 1,
-        "UW_BF16": 1,
-        "FL_STAGES": 2,
-        "FL_HALF": 1,
-        "FL_PF_ROWS": 0,
-        "FL_GRID_HF": 0,
-        "FL_PF_BLOCKS": 2,
-        "FL_EARLY": 0,
-        "FL_CSMEM": 1,
-        "FL_XSMEM": 0,
-        "FL_PF_HEADS": 0,
-        "FL_Q0SMEM": 0,
-        "FL_OUTSMEM": 0,
-        "FL_STATS_FFMA2": 0,
-        "FL_ROW_LIST": 1
+        "WARPS": 2,
+        "MINB": 4
     }
 }

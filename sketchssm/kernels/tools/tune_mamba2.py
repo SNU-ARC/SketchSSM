@@ -62,7 +62,8 @@ class Mamba2:
     def __init__(self, args):
         shape = (args.head_dim, args.num_heads // args.ngroups, args.state_size,
                  args.window)  # fmt: skip
-        self.defaults = dict(zip(self.kinds, skm.default_configs()))
+        # Tuned files store their differences from the shape defaults.
+        self.defaults = dict(zip(self.kinds, skm.shape_default_configs(*shape[1:3])))
         self.in_effect = dict(zip(self.kinds, skm.tuned_config(*shape)))
         self.layouts = make_layouts(args, args.num_heads, args.ngroups, args.state_size)
         self.name = skm.config_file_name(*shape)
@@ -72,6 +73,7 @@ class Mamba2:
         skm.tuned_config = lambda *shape: (configs["nf"], configs["flush"])
         skm.large_batch_config = lambda *shape: None
         # A candidate that does not build must fail, not fall back.
+        skm.FALLBACK_TO_DEFAULTS = False
         skm.window16_fallback = lambda *shape: False
         skm._tuned_path = lambda *shape: self.name
         skm._nf_ext.cache_clear()

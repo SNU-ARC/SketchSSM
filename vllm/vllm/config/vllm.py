@@ -3327,8 +3327,11 @@ class VllmConfig:
             unsupported.append("KV connectors")
         if self.mamba_config.backend != MambaBackendEnum.TRITON:
             unsupported.append("--mamba-backend other than triton")
-        if self.cache_config.mamba_cache_mode != "none":
-            unsupported.append("Mamba prefix caching")
+        mode = self.cache_config.mamba_cache_mode
+        if mode != "none" and not (mode == "align" and self._is_mamba2_sketchssm()):
+            unsupported.append(
+                "Mamba prefix caching other than align mode on Mamba-2 layers"
+            )
         if self.num_speculative_tokens > 0:
             unsupported.append("speculative decoding")
         if not self.use_v2_model_runner:
@@ -3342,6 +3345,15 @@ class VllmConfig:
         if unsupported:
             raise ValueError(f"{flag} does not support " + ", ".join(unsupported))
 
+    def _is_mamba2_sketchssm(self) -> bool:
+        """Whether --sketchssm runs on Mamba-2 layers (not GDN or KDA)."""
+        model = self.model_config
+        return (
+            self.cache_config.sketchssm is not None
+            and model is not None
+            and not model.supports_gdn_replayssm
+            and model.architecture not in KDA_REPLAYSSM_ARCHITECTURES
+        )
 
     def _validate_kda_replayssm(self) -> None:
         unsupported = []

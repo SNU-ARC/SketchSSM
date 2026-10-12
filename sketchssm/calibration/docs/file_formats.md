@@ -50,7 +50,7 @@ used on paper, **state tensors here are stored V-by-K**.
 | `head_qcov` | L,H,K,K | Sum of effective-query outer products |
 | `head_cov_windows` | L | Boundary observation count per head in each layer |
 | `head_cov_queries` | L | Query observation count per head in each layer |
-| `layer_ids` | optional list | Original recurrent-layer identifiers |
+| `layer_ids` | list | Model layer index of each recurrent layer, recorded by the native collectors and carried into the basis and the packaged calibration (required to package unless `config.yaml` lists `model.layer_ids`) |
 
 Counts must be positive. All heads in a layer must have the same sample count.
 Native groups are contiguous and must divide H. The fitter uses the established

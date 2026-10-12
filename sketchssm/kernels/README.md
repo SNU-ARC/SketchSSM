@@ -62,7 +62,7 @@ was built with, so install `sketchssm` alongside it.
 ```python
 from sketchssm import kernels as sk
 
-sk.API_VERSION                     # 5; bumped on a breaking change
+sk.API_VERSION                     # 6; bumped on an API change
 sk.set_config_dirs([folder, ...])  # extra tuned-config folders
 sk.set_aot_dirs([folder, ...])     # extra precompiled-kernel folders
 sk.set_cache_dir(path)             # where the NVRTC builds go
@@ -83,7 +83,7 @@ sk.gdn_decode(mixed_qkv, a, b, A_log, dt_bias, out, state, d_cache, k_cache,
               null_block_id=0, has_flush_rows=True)
 # KDA
 sk.kda_supported(num_heads, head_k_dim, head_v_dim, window, activation_dtype,
-                 state_dtype, lower_bound=-5.0) -> Support
+                 state_dtype, lower_bound=-5.0, max_rank=128) -> Support
 sk.kda_decode(q, k, v, g, beta, A_log, dt_bias, out, state, rings, slots, meta,
               pos, flush_rows, sketch, scratch, scale=128**-0.5,
               null_block_id=0, has_flush_rows=True)

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SketchSSM Gated DeltaNet decode kernels (Triton)."""
 
+import functools
+
 import torch
 
 from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_common import (
@@ -275,6 +277,11 @@ def _gdn_sketch_flush_kernel(
         row = tl.load(flush_rows + it, mask=it < batch, other=-1)
 
 
+@functools.cache
+def _shared_memory_per_block(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+
+
 def gdn_sketch_triton_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -335,11 +342,18 @@ def gdn_sketch_triton_decode(
     rocm = current_platform.is_rocm()
     # Above 32 rows, FMA dots on 16-row value blocks need less shared memory.
     fma = wp > 32
+    # At 32 rows the 32-row value blocks need ~104 KB of shared memory; GPUs
+    # with less per block (e.g. sm_120) take 16-row blocks.
+    bv = (
+        16
+        if fma or (wp > 16 and _shared_memory_per_block(state.device) < 110 << 10)
+        else 32
+    )
     _gdn_sketch_flush_kernel[(programs, hv)](
         mixed_qkv, out, state, d_cache, k_cache, g_cache, slots, meta, flush_rows,
         batch, s.beta, s.current_d, s.current_k, t.ranks, t.layout, scale,
         mixed_qkv.stride(0), *strides[:-1], s.beta.stride(0), s.current_d.stride(0),
-        s.current_k.stride(0), H=h, HV=hv, K=k, V=v, W=w, WP=wp, BV=16 if fma else 32,
+        s.current_k.stride(0), H=h, HV=hv, K=k, V=v, W=w, WP=wp, BV=bv,
         PROJ_PRECISION=None if rocm else "ieee" if fma else "tf32",
         DOT_PRECISION=None if rocm else "ieee" if fma else "tf32x3",
         num_warps=8 if fma else 4,

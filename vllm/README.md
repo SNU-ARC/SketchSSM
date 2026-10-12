@@ -1,4 +1,114 @@
 <!-- markdownlint-disable MD001 MD041 -->
+<!-- ===================== SketchSSM fork ===================== -->
+# vLLM with SketchSSM (research fork)
+
+> This directory is [vLLM](https://github.com/vllm-project/vllm) (Apache-2.0)
+> v0.30.0, upstream commit
+> [`ced6857af`](https://github.com/vllm-project/vllm/commit/ced6857af), plus the
+> SketchSSM commits. SketchSSM keeps the exact recurrent state and an exact
+> flush every 16 decode steps (ReplaySSM's window), but on the steps in between
+> reads a compact per-request sketch of the state instead of the full state. The
+> per-layer frames and per-head sketch ranks come from the offline calibration
+> in the parent repository.
+
+## Try it out
+
+```bash
+cd vllm
+VLLM_USE_PRECOMPILED=1 pip install -e .
+pip install sketchssm   # the CUDA kernels; without them vLLM uses its Triton kernels
+
+# A calibration from the Hugging Face Hub; pick the rank budget at load time.
+vllm serve nvidia/NVIDIA-Nemotron-Nano-9B-v2 --trust-remote-code \
+    --sketchssm SketchSSM/Nemotron-Nano-9B-v2-BF16 --sketchssm-mean-rank 8 \
+    --mamba-ssm-cache-dtype float32
+```
+
+Mamba prefix caching works in align mode on Mamba-2 layers (the default for
+NemotronH when prefix caching is on). Gated DeltaNet and KDA models need
+`--no-enable-prefix-caching`.
+
+`--sketchssm` also takes a local portable calibration file (`python -m
+sketchssm.calibration package` in the parent repository) or frames exported for
+one budget (`python -m sketchssm.calibration export`, then no
+`--sketchssm-mean-rank`).
+
+| flag | meaning & constraints |
+|---|---|
+| `--sketchssm PATH_OR_REPO` | enables SketchSSM with a calibration: a local file, a directory or a Hugging Face repo id holding `calibration.pt`. Model Runner V2, FP32 SSM cache, Mamba prefix caching only in align mode on Mamba-2 layers, TP=1, no speculative decoding. |
+| `--sketchssm-mean-rank R` | rank budget (mean sketch rank per state head, default 8) for a portable calibration; any value works, the per-head ranks and frames are allocated when the model loads. |
+| `--replayssm-buffer-len W` | SketchSSM window (flush every W steps, default 16); the CUDA kernels take any multiple of 16. Tuned knobs are per window (`--window` in the tuners); without a file for W the W=16 knobs, then the GPU's defaults, are used. |
+| `VLLM_SKETCHSSM_USE_CUDA=0` | force the portable Triton kernels. |
+
+`--use-replayssm` alone is upstream ReplaySSM for Mamba-2; Gated DeltaNet and
+KDA layers use their window rings only for SketchSSM. See
+[`docs/features/sketchssm.md`](docs/features/sketchssm.md).
+
+| Model | Calibration (Hugging Face) | Collected with |
+|---|---|---|
+| Nemotron Nano 9B v2 | `SketchSSM/Nemotron-Nano-9B-v2-BF16` | BF16 `nvidia/NVIDIA-Nemotron-Nano-9B-v2` |
+| Nemotron 3 Super | `SketchSSM/Nemotron-3-Super-NVFP4` | NVFP4 `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` |
+| Qwen3.8 Flash-Next | `SketchSSM/Qwen3.8-Flash-Next-NVFP4` | NVFP4 `RadixArk/Qwen3.8-Flash-Next-NVFP4` |
+| GLM 5.3 Flash | `SketchSSM/GLM-5.3-Flash-NVFP4` | NVFP4 `RedHatAI/GLM-5.3-Flash-NVFP4` |
+| Qwen3.5 9B | `SketchSSM/Qwen3.5-9B-BF16` | BF16 `Qwen/Qwen3.5-9B` |
+
+The CUDA kernels live in the parent repository's
+[`sketchssm/kernels/`](../sketchssm/kernels/) package; vLLM uses them when it is
+installed and its own Triton kernels otherwise. Their build knobs default to the
+paper's B300 configuration (H100 and B300 files are included) and can be tuned per GPU,
+layer shape and window with the package's tools, for example:
+
+```bash
+python -m sketchssm.kernels.tools.tune_mamba2 \
+    --calibration nano_g6.pt --layer 13 --head-dim 80 --save-configs
+python -m sketchssm.kernels.tools.benchmark_mamba2 \
+    --calibration nano_g6.pt --layer 13 --head-dim 80 --phase mixed
+```
+
+Outputs do not depend on the knobs.
+
+Model-level measurements (every recurrent kernel of real decode steps, as in
+the paper) are in the parent repository's `benchmarks/`.
+
+## Status
+
+| model family | kernels | shapes |
+|---|---|---|
+| Mamba-2 (Nemotron Nano / Super) | the paper's CUDA kernels and a portable Triton fallback | state size 64, 128 or 256 |
+| Gated DeltaNet (Qwen3.5, Qwen3.8 Flash-Next) | the paper's CUDA kernels and a portable Triton fallback | 1 to 8 value heads per key head, head dim 128 |
+| KDA (GLM 5.3 Flash) | the paper's CUDA kernels and a portable Triton fallback | head dim 128 |
+
+A full vLLM build precompiles the CUDA kernels (`cmake/external_projects/sketchssm.cmake`);
+other shapes are compiled at run time with NVRTC, without nvcc. On H100
+the kernels give bit-identical results to the paper's research kernels; the B300
+validation of this port is pending.
+
+H100, recurrent decode per layer (Nsight, all recurrent kernels), batch 256, a
+16-step window vs 16 Standard steps: Nemotron Nano 9B v2 6.11x (ReplaySSM
+1.81x); Qwen3.8 Flash-Next (first 9 GDN layers) 5.38x. These are being
+re-measured with the final kernels.
+
+## Core implementation files
+
+- [`vllm/model_executor/layers/mamba/sketchssm.py`](vllm/model_executor/layers/mamba/sketchssm.py)
+  and [`sketchssm_calibration.py`](vllm/model_executor/layers/mamba/sketchssm_calibration.py):
+  calibration loading and the mean-rank allocation.
+- Per-layer objects the model layers call:
+  [`mamba2_sketchssm.py`](vllm/model_executor/layers/mamba/mamba2_sketchssm.py),
+  [`gdn/gdn_sketchssm.py`](vllm/model_executor/layers/mamba/gdn/gdn_sketchssm.py),
+  [`kda_sketchssm.py`](vllm/model_executor/layers/mamba/kda_sketchssm.py).
+- [`vllm/model_executor/layers/mamba/ops/`](vllm/model_executor/layers/mamba/ops/):
+  `sketchssm_mamba2*.py`, `gdn_sketchssm_*.py` and `kda_sketchssm_*.py` (storage,
+  rotation, cold build and the portable Triton decode) and `sketchssm_kernels.py`
+  (selects the CUDA kernels of the `sketchssm.kernels` package).
+- [`../sketchssm/kernels/`](../sketchssm/kernels/) (see
+  `docs/PROVENANCE_{mamba2,gdn,kda}.md`): the paper's CUDA kernels and every
+  change made to them.
+
+The upstream vLLM README follows.
+
+---
+<!-- ========================================================== -->
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">

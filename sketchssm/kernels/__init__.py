@@ -13,8 +13,8 @@ from .gdn import gdn_decode, gdn_supported
 from .kda import kda_cold_build, kda_decode, kda_supported
 from .mamba2 import mamba2_decode, mamba2_supported
 
-# Bumped on a breaking change to the API below.
-API_VERSION = 5
+# Bumped on a change to the API below (6: kda_supported takes max_rank).
+API_VERSION = 6
 
 __all__ = [
     "API_VERSION",

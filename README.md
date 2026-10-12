@@ -95,12 +95,12 @@ file:
 # Calibration from the Hub
 vllm serve nvidia/NVIDIA-Nemotron-Nano-9B-v2 --trust-remote-code \
   --sketchssm SketchSSM/Nemotron-Nano-9B-v2-BF16 \
-  --mamba-ssm-cache-dtype float32 --no-enable-prefix-caching
+  --mamba-ssm-cache-dtype float32
 
 # Local calibration file
 vllm serve nvidia/NVIDIA-Nemotron-Nano-9B-v2 --trust-remote-code \
   --sketchssm outputs/nano/calibration.pt \
-  --mamba-ssm-cache-dtype float32 --no-enable-prefix-caching
+  --mamba-ssm-cache-dtype float32
 ```
 
 Optionally, `--sketchssm-mean-rank` sets the rank budget, the mean sketch rank
@@ -108,6 +108,24 @@ per state head (default 8: about 10x less state traffic at accuracy comparable t
 full-state baseline).
 
 See [`vllm/README.md`](https://github.com/SNU-ARC/SketchSSM/blob/main/vllm/README.md) for all options.
+
+Mamba prefix caching works in align mode on Mamba-2 models (the default for
+Nemotron when prefix caching is on); for Gated DeltaNet and KDA models add
+`--no-enable-prefix-caching`.
+
+## vLLM support
+
+SketchSSM is being upstreamed to vLLM. Until a feature is merged, use the fork
+in [`vllm/`](https://github.com/SNU-ARC/SketchSSM/blob/main/vllm/README.md).
+
+| Feature | Fork (`vllm/`, vLLM v0.30.0) | Upstream vLLM |
+| --- | --- | --- |
+| Mamba-2 (Nemotron Nano, Nemotron 3 Super), Triton kernels | ✅ | In review ([#61124](https://github.com/vllm-project/vllm/pull/61124)) |
+| Gated DeltaNet (Qwen3.5, Qwen3.8 Flash-Next), Triton kernels | ✅ | PR planned |
+| KDA (GLM 5.3 Flash), Triton kernels | ✅ | PR planned |
+| CUDA kernels (`pip install sketchssm`) | ✅ | PR planned |
+| Mamba prefix caching (align mode) | Mamba-2 | Mamba-2 ([#61124](https://github.com/vllm-project/vllm/pull/61124)) |
+| Tensor parallelism, speculative decoding, KV connectors | ❌ | ❌ |
 
 ## Evaluation
 

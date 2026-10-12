@@ -901,8 +901,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
             hidden_states_p, B_p, C_p = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_p
             )
-            if self.sketchssm is not None:
-                B_p, C_p = self.sketchssm.rotate(B_p, C_p)
 
             # 3. State Space Model sequence transformation
             initial_states = None
@@ -918,6 +916,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     ssm_state[kernel_ssm_indices],
                     0,
                 )
+                if self.sketchssm is not None:
+                    # The cache holds rotated states; the scan runs unrotated.
+                    initial_states = self.sketchssm.rotate_states(
+                        initial_states, inverse=True
+                    )
 
             # NOTE: final output is an in-place update of out tensor
             assert preallocated_ssm_out_p is not None
@@ -944,6 +947,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
                 state_dtype=ssm_state.dtype,
             )
+            if self.sketchssm is not None:
+                varlen_states = self.sketchssm.rotate_states(varlen_states)
 
             if is_mamba_cache_all:
                 assert mamba_block_size is not None

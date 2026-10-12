@@ -90,8 +90,8 @@ def package(bundle):
         curves=dict(joint_dot_sq_sum=curves['joint_dot_sq_sum'].detach().cpu().contiguous(),
                     joint_nstep=int(curves['joint_nstep']), meta=_plain(curves['meta'])),
         verified_mean_ranks=[], verified={})
-    # Model layer of each basis row; bundles collected before the native
-    # collectors recorded it list it in config.yaml (model.layer_ids).
+    # Model layer of each basis row, recorded by the collectors; bundles
+    # collected before they did list it in config.yaml (model.layer_ids).
     layer_ids = basis.get('layer_ids', model.get('layer_ids'))
     if layer_ids is None:
         raise ValueError('The bundle records no layer_ids (basis or config.yaml model.layer_ids)')

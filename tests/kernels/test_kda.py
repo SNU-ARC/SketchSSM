@@ -35,8 +35,9 @@ SLOW = pytest.mark.slow
 WINDOWS = [16, *(pytest.param(w, marks=SLOW) for w in (32, 64))]
 
 
-def skip_unsupported(heads: int, window: int) -> None:
-    support = kernels.kda_supported(heads, D, D, window, torch.bfloat16, torch.float32)
+def skip_unsupported(heads: int, window: int, max_rank: int = 128) -> None:
+    support = kernels.kda_supported(heads, D, D, window, torch.bfloat16,
+                                    torch.float32, max_rank=max_rank)  # fmt: skip
     if not support:
         pytest.skip(support.reason)
 
@@ -199,7 +200,9 @@ class Harness:
     persistent request rows (sketch), positions."""
 
     def __init__(self, initial, frame, ranks, num_reqs, max_batch, window=16):
-        skip_unsupported(initial.shape[1], window)
+        # Ranks 0 and 128 are dense heads.
+        sketched = [int(m) for m in ranks if 0 < int(m) < D]
+        skip_unsupported(initial.shape[1], window, max(sketched, default=1))
         self.build, self.decode = kernels.kda_cold_build, kernels.kda_decode
         self.window = window
         self.state, self.rings = paged_cache(initial, window)
@@ -633,7 +636,7 @@ def test_kda_borrowed_knobs_fallback(config_dir, clear_caches):
     (5 warps of the W = 64 step exceed the 48 KB static limit) fall back to
     the architecture default instead of failing."""
     heads = 5
-    skip_unsupported(heads, 64)
+    skip_unsupported(heads, 64, max_rank=16)
     (config_dir / kd.config_file_name(heads)).write_text('{"step": {"NW": 5}}')
     clear_caches(kd.tuned_config, kd._step_ext)
     assert kd.tuned_config(heads, 64)[0]["NW"] == 5

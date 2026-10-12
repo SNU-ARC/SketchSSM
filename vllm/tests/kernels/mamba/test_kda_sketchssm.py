@@ -17,8 +17,11 @@ pytestmark = pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="GP
 D = 128
 RANKS = [0, 3, 17, 40, 70, 128]  # dense heads and one per flush rank bucket
 H = len(RANKS)
-CUDA = skk.kda_cuda_supported(H, D, D, 16, torch.bfloat16, torch.float32)
-NO_CUDA = pytest.mark.skipif(not CUDA, reason="Requires the sketchssm package")
+CUDA = skk.kda_cuda_supported(
+    H, D, D, 16, torch.bfloat16, torch.float32,
+    max_rank=max(m for m in RANKS if 0 < m < D),
+)  # fmt: skip
+NO_CUDA = pytest.mark.skipif(not CUDA, reason="Requires the SketchSSM CUDA kernels")
 BACKENDS = [pytest.param("cuda", marks=NO_CUDA), "triton"]
 KERNELS: dict[str, tuple[Callable[..., None], Callable[..., None]]] = {
     "cuda": (skk.kda_cuda_cold_build, skk.kda_cuda_decode),
@@ -61,7 +64,10 @@ class Sim:
         specs = [((H, D, D), torch.float32), *rings.values()]
         page = (sum(math.prod(s) * t.itemsize for s, t in specs) + 511) // 512 * 512
         views = common.kda_sketch_paged_views(specs, pages, page + 1024, "cuda")
-        self.state, self.rings = views[0].copy_(initial), common.KDASketchRings(*views[1:])
+        self.state, self.rings = (
+            views[0].copy_(initial),
+            common.KDASketchRings(*views[1:]),
+        )
         frames = frame.mT.float().contiguous().cuda()
         self.tables = common.KDASketchTables(frames, torch.tensor(RANKS), window)
         self.sketch = common.KDASketchArgs.allocate(self.tables, 8, "cuda")

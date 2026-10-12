@@ -118,9 +118,11 @@ def kda_supported(
     activation_dtype: torch.dtype,
     state_dtype: torch.dtype,
     lower_bound: float = LOWER_BOUND,
+    max_rank: int = 128,
 ) -> Support:
-    """Whether a KDA layer can use the SketchSSM CUDA kernels (TMA: sm_90+),
-    and where they come from (``Support.source``)."""
+    """Whether a KDA layer whose sketch ranks are at most ``max_rank`` can use
+    the SketchSSM CUDA kernels (TMA: sm_90+), and where they come from
+    (``Support.source``)."""
     shape_ok = (
         0 < num_heads <= MAX_HEADS
         and head_k_dim == HEAD_DIM
@@ -136,7 +138,25 @@ def kda_supported(
     if not support:
         return support
     step, flush = tuned_config(num_heads, window)
-    return rt.kernel_support([step_spec(step, window), flush_spec(flush, window)])
+    support = rt.kernel_support([step_spec(step, window), flush_spec(flush, window)])
+    if not support:
+        return support
+    # The flush's rank buckets up to max_rank must fit this GPU's shared
+    # memory (the rank-128 bucket does not on sm_120); build it to know.
+    try:
+        p = _flush_ext(num_heads, window).probes
+    except RuntimeError as e:
+        return Support(False, str(e).splitlines()[-1] if str(e) else repr(e))
+    optin = drv.device_attribute(torch.cuda.current_device(),
+                                 drv.DEV_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)  # fmt: skip
+    for m in _MMAX:
+        need = max(p[f"smem{m}"], p[f"smemb{m}"] if p["nblk"] > 1 else 0)
+        if need > optin:
+            return Support(False, f"rank bucket {m} needs {need} bytes of shared "
+                           f"memory per block, above this GPU's limit of {optin}")  # fmt: skip
+        if m >= max_rank:
+            break
+    return support
 
 
 # ── specializations ──

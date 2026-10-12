@@ -90,9 +90,11 @@ class KDASketchSSM(torch.nn.Module):
                 f"that is a multiple of 16 (got {window}), gate lower bound "
                 f"{KDA_SKETCH_LOWER_BOUND}, BF16 activations and an FP32 state"
             )
+        # Ranks 0 and head_dim are dense heads.
+        sketched = ranks[heads][(ranks[heads] > 0) & (ranks[heads] < head_dim)]
         use_cuda = kda_cuda_supported(
             local, head_dim, head_dim, window, activation_dtype, state_dtype,
-            lower_bound,
+            lower_bound, max_rank=int(sketched.max()) if sketched.numel() else 1,
         )  # fmt: skip
         self._decode = kda_cuda_decode if use_cuda else kda_sketch_triton_decode
         self._cold_build = (

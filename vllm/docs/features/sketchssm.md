@@ -20,7 +20,7 @@ vllm serve <model> --sketchssm /path/to/calibration.pt
 
 ## Constraints
 
-SketchSSM is available for models that implement `SupportsSketchSSM`. It requires Model Runner V2, `--mamba-backend triton` and `--mamba-ssm-cache-dtype float32`. It does not support tensor parallelism, Mamba prefix caching, speculative decoding, stochastic rounding of the SSM state, or KV connectors.
+SketchSSM is available for models that implement `SupportsSketchSSM`. It requires Model Runner V2, `--mamba-backend triton` and `--mamba-ssm-cache-dtype float32`. Mamba prefix caching works in align mode (`--mamba-cache-mode align`) on Mamba-2 layers; GDN and KDA layers do not support it yet. It does not support tensor parallelism, speculative decoding, stochastic rounding of the SSM state, or KV connectors.
 
 ## Kernels
 

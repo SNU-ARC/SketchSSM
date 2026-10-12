@@ -72,27 +72,6 @@ class SketchTables(torch.nn.Module):
             )
 
 
-@triton.jit(do_not_specialize=["T"])
-def _rot_pair_kernel(
-    x_ptr, y_ptr, r_ptr, T, SX, SY, N: tl.constexpr, BT: tl.constexpr,
-    G: tl.constexpr,
-):  # fmt: skip
-    # Programs pg < G rotate B's groups, the rest C's.
-    pt = tl.program_id(0)
-    pg = tl.program_id(1)
-    offs_t = pt * BT + tl.arange(0, BT)
-    on = tl.arange(0, N)
-    mask = offs_t[:, None] < T
-    x = tl.load(x_ptr + offs_t[:, None] * SX + pg * N + on[None, :], mask, 0.0)
-    r = tl.load(r_ptr + (pg % G) * N * N + on[:, None] * N + on[None, :])
-    y = tl.dot(x.to(tl.float32), r, input_precision="tf32x3")
-    tl.store(
-        y_ptr + offs_t[:, None] * SY + pg * N + on[None, :],
-        y.to(y_ptr.dtype.element_ty),
-        mask,
-    )
-
-
 @triton.jit(do_not_specialize=["num_tokens"])
 def _rotate_groups_kernel(
     x_ptr,
@@ -131,39 +110,81 @@ def _rotate_groups_kernel(
     )
 
 
-def _rotate(B, C, frames_t, B_out, C_out):
-    num_tokens = B.shape[0]
-    groups, n, _ = frames_t.shape
-    if num_tokens == 0:
-        return
-    if (
-        B.stride() == C.stride()
-        and B.stride(1) == 1
-        and B.data_ptr() + B.shape[1] * B.element_size() == C.data_ptr()
-        and B_out.stride() == C_out.stride()
-        and B_out.data_ptr() + B_out.shape[1] * B_out.element_size() == C_out.data_ptr()
-    ):
-        # Adjacent B/C column slices: one launch for both.
-        _rot_pair_kernel[(triton.cdiv(num_tokens, 32), 2 * groups)](
-            B, B_out, frames_t, num_tokens, B.stride(0), B_out.stride(0), n, 32,
-            groups, num_warps=4,
-        )  # fmt: skip
-        return
-    for x, y in ((B, B_out), (C, C_out)):
-        _rotate_groups_kernel[(triton.cdiv(num_tokens, 64), groups)](
-            x, y, frames_t, num_tokens, x.stride(0), x.stride(1), y.stride(0),
-            y.stride(1), n, 64, num_warps=4,
-        )  # fmt: skip
+@triton.jit
+def _rotate_states_kernel(
+    x_ptr,
+    y_ptr,
+    frames_t_ptr,
+    heads,
+    heads_per_group,
+    stride_x_item,
+    stride_x_head,
+    stride_x_dim,
+    stride_x_dstate,
+    stride_y_item,
+    stride_y_head,
+    stride_y_dim,
+    DIM: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    INVERSE: tl.constexpr,
+):
+    # y[i, h, p, cols] = x[i, h, p] @ R_g^T[:, cols] (R_g[:, cols] if INVERSE).
+    item = tl.program_id(0) // heads
+    head = tl.program_id(0) % heads
+    group = head // heads_per_group
+    offs_p = tl.program_id(1) * BLOCK_P + tl.arange(0, BLOCK_P)
+    offs_n = tl.arange(0, N)
+    offs_c = tl.program_id(2) * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask = offs_p[:, None] < DIM
+    x = tl.load(
+        x_ptr
+        + item * stride_x_item
+        + head * stride_x_head
+        + offs_p[:, None] * stride_x_dim
+        + offs_n[None, :] * stride_x_dstate,
+        mask=mask,
+        other=0.0,
+    )
+    frame = frames_t_ptr + group * N * N
+    if INVERSE:
+        r = tl.load(frame + offs_c[None, :] * N + offs_n[:, None])
+    else:
+        r = tl.load(frame + offs_n[:, None] * N + offs_c[None, :])
+    y = tl.dot(x, r, input_precision="tf32x3")
+    tl.store(
+        y_ptr
+        + item * stride_y_item
+        + head * stride_y_head
+        + offs_p[:, None] * stride_y_dim
+        + offs_c[None, :],
+        y,
+        mask=mask,
+    )
 
 
-def sketch_rotate(
-    B: torch.Tensor, C: torch.Tensor, frames_t: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """FP32 copies of grouped B and C rotated by the transposed ``frames_t``."""
-    BC = torch.empty(B.shape[0], 2 * B.shape[1], dtype=torch.float32, device=B.device)
-    B_out, C_out = BC.split(B.shape[1], dim=1)
-    _rotate(B, C, frames_t, B_out, C_out)
-    return B_out, C_out
+def sketch_rotate_states(
+    states: torch.Tensor, frames_t: torch.Tensor, inverse: bool = False
+) -> torch.Tensor:
+    """States ``(items, heads, dim, N)`` FP32 in the rotated frame, ``S R^T``
+    (``S R`` back to the model frame if ``inverse``).
+
+    Prefill runs the unrotated chunk scan; its states enter the cache rotated.
+    """
+    items, heads, dim, n = states.shape
+    assert states.dtype == torch.float32 and frames_t.is_contiguous()
+    out = torch.empty(states.shape, dtype=torch.float32, device=states.device)
+    if items == 0:
+        return out
+    block_p, block_c = 32, min(n, 64)
+    grid = (items * heads, triton.cdiv(dim, block_p), n // block_c)
+    _rotate_states_kernel[grid](
+        states, out, frames_t, heads, heads // frames_t.shape[0],
+        *states.stride(), *out.stride()[:3], DIM=dim, N=n, BLOCK_P=block_p,
+        BLOCK_C=block_c, INVERSE=inverse, num_warps=4,
+    )  # fmt: skip
+    return out
 
 
 def sketch_query(C: torch.Tensor, frames_t: torch.Tensor) -> torch.Tensor:

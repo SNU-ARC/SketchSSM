@@ -252,6 +252,10 @@ def gdn_supported(
     support = rt.cuda_available(80)
     if not support:
         return support
+    reason = _fits(*tuned_config(num_k_heads, num_v_heads, window), num_k_heads,
+                   num_v_heads, window, occupancy=False)  # fmt: skip
+    if reason is not None:
+        return Support(False, reason)
     code = _DT_CODE[activation_dtype]
     specs = layer_specs(num_k_heads, num_v_heads, window, code, 0, code, activation_dtype)
     support = rt.kernel_support(specs)

@@ -32,7 +32,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 logger = init_logger(__name__)
 
-SKETCHSSM_KERNELS_API = 5
+SKETCHSSM_KERNELS_API = 6
 
 
 @functools.cache
@@ -207,6 +207,7 @@ def kda_cuda_supported(
     activation_dtype: torch.dtype,
     state_dtype: torch.dtype,
     lower_bound: float = KDA_SKETCH_LOWER_BOUND,
+    max_rank: int = 128,
 ) -> bool:
     sk = _package()
     return sk is not None and _supported(
@@ -219,6 +220,7 @@ def kda_cuda_supported(
             activation_dtype,
             state_dtype,
             lower_bound,
+            max_rank=max_rank,
         ),  # fmt: skip
     )
 

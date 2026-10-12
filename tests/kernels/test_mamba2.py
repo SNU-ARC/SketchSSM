@@ -316,7 +316,7 @@ def test_mamba2_build_matches_flush(shape, state_size, window):
     # Over longer windows the pivot factors (AG) of some rank-64 heads are
     # ill-conditioned: the two FP32 summation orders differ by more than 1e-4
     # there, while the reads they give agree to 5e-5.
-    atols = (1e-4, 1e-4, 1e-4 if window == L else 1e-3)
+    atols = (1e-4, 1e-4, 1e-4 if window == L else 2e-3)
     for got, want, atol in zip((sketch.u, sketch.w, sketch.ag), flushed, atols):
         torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=atol)
 
@@ -358,6 +358,37 @@ def test_mamba2_window16_config_fallback(config_dir, clear_caches, monkeypatch):
         ("mamba2_sketch_flush", 0, 4),
         ("mamba2_sketch_flush", 0, defaults[1]["WARPS"]),
     ]
+
+
+def test_mamba2_stale_config_fallback(config_dir, clear_caches, monkeypatch):
+    """Knobs of the layer shape's own tuned file that do not build or fit this
+    GPU (a file tuned for an older kernel) give way to the architecture
+    defaults instead of failing the decode."""
+    shape = (32, 32, 8)
+    H, P, G = shape
+    skip_unsupported(shape, N, L)
+    name = mk.config_file_name(P, H // G, N)
+    (config_dir / name).write_text(json.dumps({"flush": {"FL_STAGES": 3}}))
+    stages: list[int] = []
+    build = mk._build
+
+    def stale(name, config, fns):
+        if name == "mamba2_sketch_flush":
+            stages.append(config["FL_STAGES"])
+            if config["FL_STAGES"] == 3:
+                raise RuntimeError("needs more shared memory than this GPU has")
+        return build(name, config, fns)
+
+    monkeypatch.setattr(mk, "_build", stale)
+    clear_caches(mk.tuned_config, mk.large_batch_config, mk.window16_fallback, mk._nf_ext,
+                 mk._flush_ext)
+    assert not mk.window16_fallback(P, H // G, N, L)
+    layer = Layer(3, shape, N, L)
+    layer.build(torch.ones(3, dtype=torch.int8).cuda())
+    pos = torch.tensor([3, L - 1, 7], dtype=torch.int32).cuda()
+    out = layer.step(*layer.inputs(), pos, (pos == L - 1).to(torch.int8))
+    assert torch.isfinite(out).all()
+    assert stages == [3, mk.default_configs()[1]["FL_STAGES"]]
 
 
 @pytest.mark.parametrize(

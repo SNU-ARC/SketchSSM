@@ -15,7 +15,7 @@ from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2 import (
     SketchArgs,
     SketchTables,
     sketch_build,
-    sketch_rotate,
+    sketch_rotate_states,
     sketch_shapes,
 )
 from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2_triton import (
@@ -86,11 +86,12 @@ class Mamba2SketchSSM(torch.nn.Module):
         )  # fmt: skip
         self._decode = mamba2_cuda_decode if use_cuda else sketch_triton_decode
 
-    def rotate(
-        self, B: torch.Tensor, C: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """FP32 rotated copies of B and C ``(tokens, groups * state_size)``."""
-        return sketch_rotate(B, C, self.frames_t)
+    def rotate_states(
+        self, states: torch.Tensor, inverse: bool = False
+    ) -> torch.Tensor:
+        """Prefill states ``(items, heads, head_dim, state_size)`` FP32 into the
+        rotated frame of the cache (back to the model frame if ``inverse``)."""
+        return sketch_rotate_states(states, self.frames_t, inverse)
 
     def decode(
         self,

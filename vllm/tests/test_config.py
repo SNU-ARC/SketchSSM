@@ -149,19 +149,27 @@ def test_kda_recoverssm_derivation_is_revalidated():
 
 def _sketchssm_config(**overrides):
     config = SimpleNamespace(
-        model_config=SimpleNamespace(supports_sketchssm=True, architecture="M"),
+        model_config=SimpleNamespace(
+            supports_sketchssm=True, supports_gdn_replayssm=False, architecture="M"
+        ),
         kv_transfer_config=None,
         mamba_config=SimpleNamespace(
             backend=MambaBackendEnum.TRITON, enable_stochastic_rounding=False
         ),
         cache_config=SimpleNamespace(
-            mamba_cache_mode="none", mamba_ssm_cache_dtype="float32", sketchssm=None
+            mamba_cache_mode="none",
+            mamba_ssm_cache_dtype="float32",
+            sketchssm="calibration.pt",
         ),
         num_speculative_tokens=0,
         use_v2_model_runner=True,
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )
-    for method in ("_validate_sketchssm", "_check_sketchssm_kernels"):
+    for method in (
+        "_validate_sketchssm",
+        "_check_sketchssm_kernels",
+        "_is_mamba2_sketchssm",
+    ):
         setattr(config, method, getattr(VllmConfig, method).__get__(config))
     for path, value in overrides.items():
         *parents, name = path.split(".")
@@ -178,7 +186,15 @@ def _sketchssm_config(**overrides):
         ({}, None),
         ({"model_config.supports_sketchssm": False}, "not supported for"),
         ({"mamba_config.backend": MambaBackendEnum.FLASHINFER}, "--mamba-backend"),
-        ({"cache_config.mamba_cache_mode": "align"}, "Mamba prefix caching"),
+        ({"cache_config.mamba_cache_mode": "align"}, None),
+        ({"cache_config.mamba_cache_mode": "all"}, "Mamba prefix caching"),
+        (
+            {
+                "cache_config.mamba_cache_mode": "align",
+                "model_config.supports_gdn_replayssm": True,
+            },
+            "Mamba prefix caching",
+        ),
         ({"num_speculative_tokens": 2}, "speculative decoding"),
         ({"use_v2_model_runner": False}, "Model Runner V1"),
         ({"parallel_config.tensor_parallel_size": 2}, "tensor parallelism"),
@@ -236,7 +252,15 @@ def _kda_replayssm_config(**overrides):
         ({}, None),
         ({"cache_config.sketchssm": "calibration.pt"}, "are exclusive"),
         ({"mamba_config.backend": MambaBackendEnum.FLASHINFER}, "--mamba-backend"),
-        ({"cache_config.mamba_cache_mode": "align"}, "Mamba prefix caching"),
+        ({"cache_config.mamba_cache_mode": "align"}, None),
+        ({"cache_config.mamba_cache_mode": "all"}, "Mamba prefix caching"),
+        (
+            {
+                "cache_config.mamba_cache_mode": "align",
+                "model_config.supports_gdn_replayssm": True,
+            },
+            "Mamba prefix caching",
+        ),
         ({"num_speculative_tokens": 2}, "speculative decoding"),
         ({"use_v2_model_runner": False}, "Model Runner V1"),
         ({"cache_config.mamba_ssm_cache_dtype": "auto"}, "mamba-ssm-cache-dtype"),
@@ -264,7 +288,15 @@ def test_validate_gdn_replayssm(overrides, match):
         ({"model_config.architecture": "Glm5NextForCausalLM"}, None),
         ({"cache_config.sketchssm": "calibration.pt"}, "--sketchssm"),
         ({"cache_config.replayssm_buffer_len": 32}, "other than 16"),
-        ({"cache_config.mamba_cache_mode": "align"}, "Mamba prefix caching"),
+        ({"cache_config.mamba_cache_mode": "align"}, None),
+        ({"cache_config.mamba_cache_mode": "all"}, "Mamba prefix caching"),
+        (
+            {
+                "cache_config.mamba_cache_mode": "align",
+                "model_config.supports_gdn_replayssm": True,
+            },
+            "Mamba prefix caching",
+        ),
         ({"num_speculative_tokens": 1}, "speculative decoding"),
         ({"use_v2_model_runner": False}, "Model Runner V1"),
         ({"scheduler_config.async_scheduling": True}, "async scheduling"),

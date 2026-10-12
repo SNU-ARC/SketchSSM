@@ -167,3 +167,19 @@ def test_sketchssm_mamba2_decode_after_prefill_build(backend):
     layer.build(rows=torch.arange(5, dtype=torch.int32).cuda())
     assert not layer.sketch.u[int(layer.meta[-1])].any()  # padding row
     layer.checked_step(torch.tensor([0, 5, 11, 14, 0]))
+
+
+def test_sketchssm_rotate_states():
+    """Prefill states rotate into the cache frame and back."""
+    g = torch.Generator().manual_seed(0)
+    states = torch.randn(3, H, P, N, generator=g).cuda()
+    frames_t = torch.linalg.qr(torch.randn(G, N, N, generator=g))[0].contiguous().cuda()
+    rotated = sk.sketch_rotate_states(states, frames_t)
+    want = states.double().unflatten(1, (G, -1)) @ frames_t.double()[None, :, None]
+    torch.testing.assert_close(
+        rotated, want.flatten(1, 2).float(), rtol=1e-5, atol=1e-5
+    )
+    # The cache's initial states arrive as a key-major (transposed) view.
+    key_major = rotated.transpose(-1, -2).contiguous().transpose(-1, -2)
+    back = sk.sketch_rotate_states(key_major, frames_t, inverse=True)
+    torch.testing.assert_close(back, states, rtol=1e-5, atol=1e-5)
